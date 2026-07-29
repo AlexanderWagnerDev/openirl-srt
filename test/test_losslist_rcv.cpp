@@ -206,3 +206,154 @@ TEST(CRcvFreshLossListTest, StripAndDeleteReportDetectTime)
     EXPECT_EQ(detect_out, detected);
     EXPECT_TRUE(floss.empty());
 }
+
+// --------------------------------------------------------------------------
+// srtlaPlanNak: SRTLA loss-report policy
+// --------------------------------------------------------------------------
+
+namespace
+{
+using srt::sync::steady_clock;
+
+/// A record detected @a age_ms ago, never reported, TTL already satisfied.
+CRcvFreshLoss makeAged(int32_t lo, int32_t hi, int64_t age_ms)
+{
+    CRcvFreshLoss rec(lo, hi, 0);
+    rec.timestamp = steady_clock::now() - srt::sync::milliseconds_from(age_ms);
+    return rec;
+}
+
+/// Params for a 1000 ms play budget: 100 ms hold, 200 ms repeat spacing, 50 ms RTT.
+srt::SrtlaNakParams makeParams()
+{
+    srt::SrtlaNakParams p;
+    p.hold_us    = 100000;
+    p.spacing_us = 200000;
+    p.budget_us  = 1000000;
+    p.rtt_us     = 50000;
+    p.margin_us  = 30000;
+    p.cap        = 364; // as for a 1456-byte payload
+    return p;
+}
+} // namespace
+
+/// The reordering hold gates the first report; an aged record passes it.
+TEST(SrtlaPlanNak, HoldGatesFirstReport)
+{
+    std::deque<CRcvFreshLoss> floss;
+    floss.push_back(makeAged(10, 12, 50));  // younger than the 100 ms hold
+    floss.push_back(makeAged(20, 20, 150)); // past it
+
+    const srt::SrtlaNakPlan plan = srtlaPlanNak(floss, steady_clock::now(), makeParams());
+
+    ASSERT_EQ(plan.report.size(), 1u);
+    EXPECT_EQ(plan.report[0], 1u);
+    EXPECT_EQ(plan.confirmed, 1); // one packet, first report
+    EXPECT_EQ(plan.retire, 0u);
+}
+
+/// A record whose TTL has not expired yet is not reported, however old it is.
+TEST(SrtlaPlanNak, WitnessTtlBlocksReport)
+{
+    std::deque<CRcvFreshLoss> floss;
+    floss.push_back(makeAged(10, 10, 300));
+    floss[0].ttl = 1;
+
+    const srt::SrtlaNakPlan plan = srtlaPlanNak(floss, steady_clock::now(), makeParams());
+
+    EXPECT_TRUE(plan.report.empty());
+    EXPECT_EQ(plan.retire, 0u);
+}
+
+/// A repeat is held back until the spacing has elapsed.
+TEST(SrtlaPlanNak, SpacingGatesRepeat)
+{
+    const steady_clock::time_point now = steady_clock::now();
+
+    std::deque<CRcvFreshLoss> floss;
+    floss.push_back(makeAged(10, 10, 300));
+    floss.push_back(makeAged(20, 20, 300));
+    floss[0].report_time = now - srt::sync::milliseconds_from(100); // too recent
+    floss[1].report_time = now - srt::sync::milliseconds_from(250); // due again
+
+    const srt::SrtlaNakPlan plan = srtlaPlanNak(floss, now, makeParams());
+
+    ASSERT_EQ(plan.report.size(), 1u);
+    EXPECT_EQ(plan.report[0], 1u);
+    EXPECT_EQ(plan.confirmed, 0); // a repeat is not a newly confirmed loss
+}
+
+/// Once no round trip fits in what is left of the play budget, the record is no
+/// longer requested.
+TEST(SrtlaPlanNak, DeadlineStopsRequesting)
+{
+    srt::SrtlaNakParams p = makeParams(); // budget 1000 ms, rtt 50 ms, margin 30 ms
+
+    std::deque<CRcvFreshLoss> floss;
+    floss.push_back(makeAged(10, 10, 950)); // 950 + 50 + 30 > 1000 -> hopeless
+    floss.push_back(makeAged(20, 20, 800)); // 800 + 50 + 30 < 1000 -> still worth it
+
+    const srt::SrtlaNakPlan plan = srtlaPlanNak(floss, steady_clock::now(), p);
+
+    ASSERT_EQ(plan.report.size(), 1u);
+    EXPECT_EQ(plan.report[0], 1u);
+    EXPECT_EQ(plan.retire, 0u); // not past the budget yet, so not retired either
+
+    // With deadline handling off (no TSBPD) both are requested again.
+    p.budget_us = 0;
+    const srt::SrtlaNakPlan unbounded = srtlaPlanNak(floss, steady_clock::now(), p);
+    EXPECT_EQ(unbounded.report.size(), 2u);
+    EXPECT_EQ(unbounded.retire, 0u);
+}
+
+/// Records past the play budget form a prefix and are retired, not reported.
+TEST(SrtlaPlanNak, RetiresPrefixPastBudget)
+{
+    std::deque<CRcvFreshLoss> floss;
+    floss.push_back(makeAged(10, 10, 3000)); // long dead
+    floss.push_back(makeAged(20, 20, 1500)); // dead
+    floss.push_back(makeAged(30, 30, 150));  // live and due
+
+    const srt::SrtlaNakPlan plan = srtlaPlanNak(floss, steady_clock::now(), makeParams());
+
+    EXPECT_EQ(plan.retire, 2u);
+    ASSERT_EQ(plan.report.size(), 1u);
+    EXPECT_EQ(plan.report[0], 2u); // index refers to the untouched container
+    EXPECT_EQ(plan.confirmed, 1);
+}
+
+/// The report is capped at the payload size, counting 2 words per range and 1 per
+/// single sequence. Nothing is reported beyond the cap.
+TEST(SrtlaPlanNak, RespectsPayloadCap)
+{
+    srt::SrtlaNakParams p = makeParams();
+    p.cap = 5; // room for two ranges (4 words) plus one single sequence
+
+    std::deque<CRcvFreshLoss> floss;
+    floss.push_back(makeAged(10, 12, 150)); // range -> 2 words
+    floss.push_back(makeAged(20, 22, 150)); // range -> 2 words
+    floss.push_back(makeAged(30, 30, 150)); // single -> 1 word
+    floss.push_back(makeAged(40, 40, 150)); // does not fit any more
+
+    const srt::SrtlaNakPlan plan = srtlaPlanNak(floss, steady_clock::now(), p);
+
+    ASSERT_EQ(plan.report.size(), 3u);
+    EXPECT_EQ(plan.report[2], 2u);
+    EXPECT_EQ(plan.confirmed, 3 + 3 + 1);
+}
+
+/// The prefix assumption behind the retire scan: a SPLIT keeps the deque ordered by
+/// detection time, so retiring may never scan the whole container.
+TEST(SrtlaPlanNak, SplitKeepsDequeOrderedByAge)
+{
+    std::deque<CRcvFreshLoss> floss;
+    floss.push_back(makeAged(10, 10, 900));
+    floss.push_back(makeAged(20, 30, 500));
+    floss.push_back(makeAged(40, 40, 100));
+
+    ASSERT_TRUE(CRcvFreshLoss::removeOne((floss), 25, NULL, NULL)); // splits record 1
+    ASSERT_EQ(floss.size(), 4u);
+
+    for (size_t i = 1; i < floss.size(); ++i)
+        EXPECT_LE(floss[i - 1].timestamp, floss[i].timestamp) << "order broken at " << i;
+}

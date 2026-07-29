@@ -272,6 +272,7 @@ const uint32_t SRTLA_HOLD_EVIDENCE_MARGIN_US = 30000;
 const int64_t  SRTLA_HOLD_DECAY_TAU_US       = 20000000;
 const double   SRTLA_RENAK_RTT_FACTOR        = 1.3;
 const int      SRTLA_MIN_RCVLATENCY_MS       = 1000;
+const int64_t  SRTLA_DEADLINE_MARGIN_US      = 30000;
 
 // Sampling window for pctSndQuality / pctRcvQuality.
 const int64_t  QUALITY_WINDOW_US             = 1000000; // 1 s
@@ -11067,7 +11068,9 @@ void srt::CUDT::dropFromLossLists(int32_t from, int32_t to)
             << range.str() << " packets)");
 #endif
 
-    if (m_bPeerRexmitFlag == 0 || m_iReorderTolerance == 0)
+    // SRTLA fills m_FreshLoss from a time-based hold, independently of the reorder
+    // tolerance. Same condition as in unlose().
+    if (m_bPeerRexmitFlag == 0 || (!m_config.bSRTLA && m_iReorderTolerance == 0))
         return;
 
     // All code below concerns only "belated lossreport" feature.
@@ -11603,26 +11606,38 @@ int srt::CUDT::checkNAKTimer(const steady_clock::time_point& currtime)
             int             confirmed_loss = 0;
             {
                 ScopedLock lk(m_RcvLossLock);
-                const uint32_t hold_us    = srtlaReorderHoldUs(currtime);
-                const int64_t  srtt_us    = m_iSRTT.load();
-                const int64_t  spacing_us = std::max<int64_t>(
+
+                const int64_t srtt_us = m_iSRTT.load();
+
+                SrtlaNakParams np;
+                np.hold_us    = srtlaReorderHoldUs(currtime);
+                np.spacing_us = std::max<int64_t>(
                         (int64_t)(SRTLA_RENAK_RTT_FACTOR * (double)srtt_us),
                         count_microseconds(m_tdNAKInterval));
-                const size_t cap = (size_t)m_iMaxSRTPayloadSize / 4;
-                for (deque<CRcvFreshLoss>::iterator i = m_FreshLoss.begin();
-                     i != m_FreshLoss.end() && lossdata.size() + 2 <= cap; ++i)
+                // No TSBPD means no play deadline and no TLPKTDROP: deadline handling off.
+                np.budget_us  = m_bTsbPd ? (int64_t)m_iTsbPdDelay_ms * 1000 : 0;
+                np.rtt_us     = srtt_us;
+                np.margin_us  = SRTLA_DEADLINE_MARGIN_US;
+                np.cap        = (size_t)m_iMaxSRTPayloadSize / 4;
+
+                const SrtlaNakPlan plan = srtlaPlanNak(m_FreshLoss, currtime, np);
+
+                lossdata.reserve(2 * plan.report.size());
+                for (size_t k = 0; k < plan.report.size(); ++k)
                 {
-                    if (i->ttl > 0)
-                        continue;
-                    if (count_microseconds(currtime - i->timestamp) < (int64_t)hold_us)
-                        continue;
-                    if (!is_zero(i->report_time)
-                            && count_microseconds(currtime - i->report_time) < spacing_us)
-                        continue;
-                    addLossRecord(lossdata, i->seq[0], i->seq[1]);
-                    if (is_zero(i->report_time)) // first report for this record, not a repeat
-                        confirmed_loss += CSeqNo::seqoff(i->seq[0], i->seq[1]) + 1;
-                    i->report_time = currtime;
+                    CRcvFreshLoss& rec = m_FreshLoss[plan.report[k]];
+                    addLossRecord(lossdata, rec.seq[0], rec.seq[1]);
+                    rec.report_time = currtime;
+                }
+                confirmed_loss = plan.confirmed;
+
+                // The indices above address the untouched container, so retire only now.
+                if (plan.retire > 0)
+                {
+                    HLOGC(qrlog.Debug,
+                          log << CONID() << "SRTLA: retiring " << plan.retire << " loss record(s) past the "
+                              << m_iTsbPdDelay_ms << "ms play budget (" << m_FreshLoss.size() << " held)");
+                    m_FreshLoss.erase(m_FreshLoss.begin(), m_FreshLoss.begin() + plan.retire);
                 }
             }
             if (!lossdata.empty())

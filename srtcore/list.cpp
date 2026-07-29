@@ -955,3 +955,58 @@ bool srt::CRcvFreshLoss::removeOne(std::deque<CRcvFreshLoss>& w_container, int32
 
 }
 
+srt::SrtlaNakPlan srt::srtlaPlanNak(const std::deque<CRcvFreshLoss>&      fresh,
+                                    const srt::sync::steady_clock::time_point& now,
+                                    const SrtlaNakParams&                 params)
+{
+    using namespace srt::sync;
+
+    SrtlaNakPlan plan;
+
+    // Records are appended in detection order, and a split in removeOne() copies the
+    // original timestamp into both halves, so the container is sorted by age: everything
+    // past the play budget is a prefix.
+    if (params.budget_us > 0)
+    {
+        while (plan.retire < fresh.size()
+               && count_microseconds(now - fresh[plan.retire].timestamp) > params.budget_us)
+        {
+            ++plan.retire;
+        }
+    }
+
+    size_t used = 0; // 32-bit words already claimed in the report
+
+    for (size_t i = plan.retire; i < fresh.size(); ++i)
+    {
+        const CRcvFreshLoss& rec = fresh[i];
+
+        if (rec.ttl > 0)
+            continue; // not yet witnessed by enough subsequent packets
+
+        const int64_t age_us = count_microseconds(now - rec.timestamp);
+        if (age_us < params.hold_us)
+            continue; // still within the reordering grace period
+
+        // No round trip fits in what is left of the play budget.
+        if (params.budget_us > 0 && age_us + params.rtt_us + params.margin_us > params.budget_us)
+            continue;
+
+        const bool first_report = is_zero(rec.report_time);
+        if (!first_report && count_microseconds(now - rec.report_time) < params.spacing_us)
+            continue; // repeat not due yet
+
+        const size_t cost = (rec.seq[0] == rec.seq[1]) ? 1 : 2;
+        if (used + cost > params.cap)
+            break; // report is full, the remaining records get their turn next cycle
+
+        plan.report.push_back(i);
+        used += cost;
+
+        if (first_report)
+            plan.confirmed += CSeqNo::seqoff(rec.seq[0], rec.seq[1]) + 1;
+    }
+
+    return plan;
+}
+
