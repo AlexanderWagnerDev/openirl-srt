@@ -270,7 +270,6 @@ const uint32_t SRTLA_HOLD_CAP_US             = 500000;
 const uint32_t SRTLA_HOLD_FALLBACK_US        = 250000;
 const uint32_t SRTLA_HOLD_EVIDENCE_MARGIN_US = 30000;
 const int64_t  SRTLA_HOLD_DECAY_TAU_US       = 20000000;
-const double   SRTLA_RENAK_RTT_FACTOR        = 1.3;
 const int      SRTLA_MIN_RCVLATENCY_MS       = 1000;
 const int64_t  SRTLA_DEADLINE_MARGIN_US      = 30000;
 
@@ -11570,7 +11569,10 @@ int srt::CUDT::checkNAKTimer(const steady_clock::time_point& currtime)
     // by the filter. By this reason they appear often out of order
     // and for adding them properly the loss list container wasn't
     // prepared. This then requires some more effort to implement.
-    if (!m_config.bRcvNakReport || m_PktFilterRexmitLevel != SRT_ARQ_ALWAYS)
+    // Under SRTLA this is the only loss-report emitter, so SRTO_NAKREPORT must not
+    // disable it - the hold is the pacing. The packet-filter condition still applies.
+    const bool srtla_emitter = m_config.bSRTLA && m_bPeerRexmitFlag;
+    if ((!m_config.bRcvNakReport && !srtla_emitter) || m_PktFilterRexmitLevel != SRT_ARQ_ALWAYS)
         return BECAUSE_NO_REASON;
 
     /*
@@ -11591,7 +11593,7 @@ int srt::CUDT::checkNAKTimer(const steady_clock::time_point& currtime)
         if (currtime <= m_tsNextNAKTime.load())
             return BECAUSE_NO_REASON; // wait for next NAK time
 
-        if (m_config.bSRTLA && m_bPeerRexmitFlag)
+        if (srtla_emitter)
         {
             // SRTLA: time-gated loss reporting (single emitter for first
             // reports and repeats).
@@ -11611,8 +11613,9 @@ int srt::CUDT::checkNAKTimer(const steady_clock::time_point& currtime)
 
                 SrtlaNakParams np;
                 np.hold_us    = srtlaReorderHoldUs(currtime);
-                np.spacing_us = std::max<int64_t>(
-                        (int64_t)(SRTLA_RENAK_RTT_FACTOR * (double)srtt_us),
+                // A round trip plus the reorder spread: SRTT tracks the fastest path,
+                // the retransmission may travel the slowest.
+                np.spacing_us = std::max<int64_t>(srtt_us + np.hold_us,
                         count_microseconds(m_tdNAKInterval));
                 // No TSBPD means no play deadline and no TLPKTDROP: deadline handling off.
                 np.budget_us  = m_bTsbPd ? (int64_t)m_iTsbPdDelay_ms * 1000 : 0;

@@ -342,6 +342,32 @@ TEST(SrtlaPlanNak, RespectsPayloadCap)
     EXPECT_EQ(plan.confirmed, 3 + 3 + 1);
 }
 
+/// A never-reported loss is not crowded out of a full report by repeats of older
+/// records, and the report still goes out in sequence order.
+TEST(SrtlaPlanNak, FreshLossOutranksRepeats)
+{
+    const steady_clock::time_point now = steady_clock::now();
+
+    srt::SrtlaNakParams p = makeParams();
+    p.cap = 2; // room for exactly two single sequences
+
+    std::deque<CRcvFreshLoss> floss;
+    floss.push_back(makeAged(10, 10, 400)); // old, already reported, repeat is due
+    floss.push_back(makeAged(20, 20, 400)); // ditto
+    floss.push_back(makeAged(30, 30, 150)); // never reported
+    floss[0].report_time = now - srt::sync::milliseconds_from(250);
+    floss[1].report_time = now - srt::sync::milliseconds_from(250);
+
+    const srt::SrtlaNakPlan plan = srtlaPlanNak(floss, now, p);
+
+    ASSERT_EQ(plan.report.size(), 2u);
+    EXPECT_NE(std::find(plan.report.begin(), plan.report.end(), size_t(2)), plan.report.end());
+    EXPECT_EQ(plan.confirmed, 1);
+
+    for (size_t i = 1; i < plan.report.size(); ++i)
+        EXPECT_LT(plan.report[i - 1], plan.report[i]);
+}
+
 /// The prefix assumption behind the retire scan: a SPLIT keeps the deque ordered by
 /// detection time, so retiring may never scan the whole container.
 TEST(SrtlaPlanNak, SplitKeepsDequeOrderedByAge)
