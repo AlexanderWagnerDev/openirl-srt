@@ -61,9 +61,13 @@ public:
     static const size_t   SRT_MIN_LEN          = 16; // min length treated as an SRT packet
     static const size_t   MIN_PAD              = 32; // short control packets padded to this
     static const int      RECV_ACK_INT         = 10; // SRT data packets per SRTLA ACK (batch cap)
-    static const int64_t  ACK_FLUSH_US         = 30000; // partial-batch flush age
+    static const int64_t  ACK_FLUSH_US         = 10000; // partial-batch flush age
     static const size_t   MAX_CONNS_PER_GROUP  = 16; // == SRT_SRTLA_MAX_PEERS
     static const size_t   MAX_GROUPS           = 200;
+
+    static const size_t   NAK_FANOUT           = 2;       // links a loss report is duplicated over
+    static const int64_t  LINK_FRESH_US        = 1000000; // age up to which a transit measurement counts
+    static const int64_t  LINK_PASS_US         = 2000;    // period of the per-link pass in onPeriodic()
     static const int32_t  SN_WINDOW_SIZE       = 65536; // retransmission-tracking bitmap
     static const int32_t  SN_WINDOW_MASK       = SN_WINDOW_SIZE - 1;
 
@@ -172,7 +176,7 @@ private:
         SRTSOCKET       socket_id; // bound CUDT socket id, or SRT_INVALID_SOCK
         bool            bound;
         time_point      created_at;
-        sockaddr_any    last_addr;   // most recently active link (reverse path primary)
+        sockaddr_any    last_addr;   // most recently active link (reverse path, REG1 idempotency)
         bool            has_last_addr;
         bool            data_seen;
 
@@ -274,6 +278,7 @@ private:
     std::map<sockaddr_any, Group*, AddrLess>  m_EgressMap; // CUDT peer addr → group (bind lifetime)
 
     time_point m_LastCleanup;
+    time_point m_LastLinkPass;
     bool       m_HaveTimers;
 
     SrtlaRec(const SrtlaRec&);

@@ -11,6 +11,7 @@
 
 #include "platform_sys.h"
 
+#include <algorithm>
 #include <random>
 
 #include "srtla_rec.h"
@@ -600,24 +601,52 @@ bool srt::SrtlaRec::onEgress(const sockaddr_any& peer, CPacket& pkt, const socka
     if (!g)
         return false; // not an SRTLA group destination: caller sends normally
 
+    if (g->links.empty())
+    {
+        // Registration gone but the CUDT still alive: fall back to its peer address.
+        m_pChannel->sendto(peer, pkt, src);
+        return true;
+    }
+
     if (pkt.isControl())
     {
         const UDTMessageType mt = pkt.getType();
-        if (mt == UMSG_ACK || mt == UMSG_LOSSREPORT)
+
+        if (mt == UMSG_ACK)
         {
-            // Fan SRT ACK / NAK out to every link so the sender can balance and
-            // recover on all paths. sendto() round-trips byte order per call.
+            // Every link: the sender rebuilds its per-link in-flight counts from these.
             for (std::list<Link>::iterator it = g->links.begin(); it != g->links.end(); ++it)
                 m_pChannel->sendto(it->addr, pkt, src);
-            if (g->links.empty())
-                m_pChannel->sendto(peer, pkt, src);
+            return true;
+        }
+
+        if (mt == UMSG_LOSSREPORT)
+        {
+            // NAK_FANOUT links only, starting with the one that most recently delivered.
+            size_t sent = 0;
+            for (std::list<Link>::iterator it = g->links.begin(); it != g->links.end(); ++it)
+            {
+                if (g->has_last_addr && it->addr == g->last_addr)
+                {
+                    m_pChannel->sendto(it->addr, pkt, src);
+                    ++sent;
+                    break;
+                }
+            }
+            for (std::list<Link>::iterator it = g->links.begin();
+                 it != g->links.end() && sent < NAK_FANOUT; ++it)
+            {
+                if (g->has_last_addr && it->addr == g->last_addr)
+                    continue;
+                m_pChannel->sendto(it->addr, pkt, src);
+                ++sent;
+            }
             return true;
         }
     }
 
-    // Everything else goes to the group's most recently active link.
-    const sockaddr_any& dst = g->has_last_addr ? g->last_addr : peer;
-    m_pChannel->sendto(dst, pkt, src);
+    // Everything else goes over the most recently active link.
+    m_pChannel->sendto(g->has_last_addr ? g->last_addr : peer, pkt, src);
     return true;
 }
 
@@ -661,18 +690,25 @@ void srt::SrtlaRec::onPeriodic(const time_point& now)
 
     if (!m_HaveTimers)
     {
-        m_LastCleanup = now;
-        m_HaveTimers  = true;
+        m_LastCleanup  = now;
+        m_LastLinkPass = now;
+        m_HaveTimers   = true;
         return;
     }
 
-    // Flush aged partial SRTLA-ACK batches (covers links that went quiet).
-    for (std::list<Group>::iterator g = m_Groups.begin(); g != m_Groups.end(); ++g)
+    // Flush aged partial SRTLA-ACK batches (covers links that went quiet). Throttled:
+    // the pass is O(groups x links) and the receive worker reaches it once per datagram.
+    if (count_microseconds(now - m_LastLinkPass) >= LINK_PASS_US)
     {
-        for (std::list<Link>::iterator it = g->links.begin(); it != g->links.end(); ++it)
+        m_LastLinkPass = now;
+
+        for (std::list<Group>::iterator g = m_Groups.begin(); g != m_Groups.end(); ++g)
         {
-            if (it->ack_count > 0 && count_microseconds(now - it->ack_first_pending) >= ACK_FLUSH_US)
-                sendSrtlaAck(it->addr, *it);
+            for (std::list<Link>::iterator it = g->links.begin(); it != g->links.end(); ++it)
+            {
+                if (it->ack_count > 0 && count_microseconds(now - it->ack_first_pending) >= ACK_FLUSH_US)
+                    sendSrtlaAck(it->addr, *it);
+            }
         }
     }
 
@@ -763,12 +799,17 @@ uint32_t srt::SrtlaRec::holdSteadyUs(SRTSOCKET socket_id)
     if (!grp)
         return 0;
 
+    const time_point now = steady_clock::now();
+
     double tmin = 0.0, tmax = 0.0, jmax = 0.0;
     bool   have = false;
     for (std::list<Link>::iterator it = grp->links.begin(); it != grp->links.end(); ++it)
     {
-        if (!it->transit_valid)
+        // transit_ewma only advances on arriving data, so a stale one is not a current
+        // measurement and must not widen the spread.
+        if (!it->transit_valid || count_microseconds(now - it->last_transit) > LINK_FRESH_US)
             continue;
+
         if (!have)
         {
             tmin = tmax = it->transit_ewma;
