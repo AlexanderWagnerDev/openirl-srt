@@ -190,7 +190,8 @@ def run(scn, name, variant, out, seed, ips):
         p = subprocess.Popen(args, stderr=open(os.path.join(d, err), 'w'), stdout=subprocess.DEVNULL); procs.append(p); return p
     plain = scn.get('plain', False)
     rcv = start([os.path.join(BUILD, 'receiver-' + variant), str(PORT_RCV), '--latency', str(lat), '--lossmaxttl', '50', '--kbps', str(scn['kbps']),
-                 '--srtla', '0' if plain else '1', '--duration', str(dur + 25), '--stats', os.path.join(d, 'rcv.jsonl')], 'rcv.err')
+                 '--srtla', '0' if plain else '1', '--duration', str(dur + 25), '--stats', os.path.join(d, 'rcv.jsonl')]
+                + (['--debug', '1'] if os.environ.get('RECEIVER_DEBUG') == '1' else []), 'rcv.err')
     prx = start([sys.executable, os.path.join(ROOT, 'proxy.py'), os.path.join(d, 'proxy.json')], 'proxy.err')
     time.sleep(0.5)
     if plain:
@@ -213,6 +214,8 @@ def run(scn, name, variant, out, seed, ips):
         try: p.wait(timeout=3)
         except subprocess.TimeoutExpired: p.kill()
     time.sleep(1.0)  # let the ports drain before the next run
+    json.dump(dict(receiver=rcv.returncode, proxy=prx.returncode, srtla_send=(ss.returncode if ss else None), sender=snd.returncode),
+              open(os.path.join(d, 'exit.json'), 'w'))
     return d
 
 def jl(path):
@@ -264,6 +267,12 @@ def summarise(d, scn=None):
     m['proxy_lost'] = lost
     # a host stall shows as a late proxy tick (they are 1.0 s apart); such a run is not a receiver result
     m['stall_max_ms'] = round(max((b - a for a, b in zip(ticks, ticks[1:])), default=1.0) * 1000 - 1000)
+    # a run is only a measurement if the stream lived for the whole duration: a sender that died
+    # early (crash, connection break) leaves too few stat rows and an absurd end-to-end latency
+    try: ex = json.load(open(os.path.join(d, 'exit.json')))
+    except FileNotFoundError: ex = {}
+    m['exit'] = ex
+    m['broken'] = (scn is not None and len(s_rows) < scn['dur'] - 5) or (ex.get('sender') not in (None, 0)) or (ex.get('receiver') not in (None, 0))
     pps = m['snd_sent'] / max(1, len(s_rows))
     m.update(lag_percentiles(d, pps))
     if scn is not None:
@@ -297,7 +306,7 @@ if __name__ == '__main__':
             t0 = time.time(); print('== %s / %s' % (name, v), file=sys.stderr, flush=True)
             d = run(scn, name, v, out, a.seed, ips)
             m = summarise(d, scn); results.setdefault(name, {})[v] = m
-            print('   %.0fs  missing %d  rcvdrop %d  snddrop %d/%d  nak %d  retrans %d  belated %d  lag p99 %s  stall %d  share %s' % (
+            print('   %.0fs  missing %d  rcvdrop %d  snddrop %d/%d  nak %d  retrans %d  belated %d  lag p99 %s  stall %d  share %s%s' % (
                 time.time() - t0, m['app_missing'], m['rcv_drop'], m['snd_drop'], m['app_drop'], m['rcv_nak'], m['snd_retrans'], m['rcv_belated'],
-                m.get('lag_p99', '-'), m['stall_max_ms'], m['share']), file=sys.stderr, flush=True)
+                m.get('lag_p99', '-'), m['stall_max_ms'], m['share'], '  BROKEN RUN exit=%s' % m['exit'] if m['broken'] else ''), file=sys.stderr, flush=True)
             json.dump(results, open(summary_path, 'w'), indent=1)

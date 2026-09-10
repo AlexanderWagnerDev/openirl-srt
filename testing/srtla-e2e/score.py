@@ -83,6 +83,8 @@ def main():
                 if not m: continue
                 if m.get('stall_max_ms', 0) > STALL_LIMIT_MS:
                     excluded.append('%s/%s/%s (host stall %d ms)' % (out, scn, v, m['stall_max_ms'])); continue
+                if m.get('broken') or (m.get('lat_p50_median', 0) - (m.get('lat') or m.get('lat_negotiated') or 0) > 1000) or m.get('lag_p99') is None:
+                    excluded.append('%s/%s/%s (stream died early, exit %s)' % (out, scn, v, m.get('exit', '?'))); continue
                 sc = subscores(m, out, scn, v)
                 e = agg.setdefault(v, dict(sub={}, n=0, missing=0, snddrop=0, nak=0, rexmit=0, belated=0, lat_rcv_min=10**9))
                 e['lat_rcv_min'] = min(e['lat_rcv_min'], m.get('lat_rcv_effective', 10**9) if m.get('lat_rcv_effective', -1) > 0 else 10**9)

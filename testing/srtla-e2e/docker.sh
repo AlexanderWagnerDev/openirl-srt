@@ -7,12 +7,14 @@
 #
 # The fork is bind-mounted; build.sh clones the BELABOX repositories inside the container into
 # build-linux/deps/, and results land in results/<out>/ on the host like a native run.
-# Env: IMAGE, BELABOX_SRT_REF, BELABOX_SRTLA_REF.
+# Env: IMAGE, BELABOX_SRT_REF, BELABOX_SRTLA_REF, CMAKE_EXTRA, RECEIVER_DEBUG=1 (receiver at debug
+# log level, for heavy-logging builds).
 set -eu
 HERE=$(cd "$(dirname "$0")" && pwd); REPO=$(cd "$HERE/../.." && pwd)
 IMAGE=${IMAGE:-srtla-e2e}
 docker image inspect "$IMAGE" >/dev/null 2>&1 || docker build -t "$IMAGE" -f "$HERE/Dockerfile" "$HERE"
 mounts="-v $REPO:/work/srt -e BELABOX_SRT_REF -e BELABOX_SRTLA_REF"
+mounts="$mounts -e CMAKE_EXTRA=${CMAKE_EXTRA:-} -e RECEIVER_DEBUG=${RECEIVER_DEBUG:-0}"
 cmd=${1:-run}; [ $# -gt 0 ] && shift
 case "$cmd" in
   build) exec docker run --rm $mounts -e BUILD_DIR=build-linux "$IMAGE" ./build.sh "$@" ;;

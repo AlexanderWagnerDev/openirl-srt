@@ -10,6 +10,7 @@
 # Usage: build.sh [name=ref ...]          default: head=HEAD
 #   e.g. build.sh head=HEAD main=main
 # Env:   BELABOX_SRT_REF, BELABOX_SRTLA_REF  commits of the BELABOX repositories (default: the pinned ones below)
+#        CMAKE_EXTRA       extra cmake options for the receivers (e.g. -DENABLE_HEAVY_LOGGING=ON)
 #        CMAKE                        cmake binary (default: cmake on PATH, else CLion's bundled one)
 set -eu
 HERE=$(cd "$(dirname "$0")" && pwd); REPO=$(cd "$HERE/../.." && pwd); B="$HERE/${BUILD_DIR:-build}"
@@ -24,6 +25,8 @@ fi
 export CMAKE_POLICY_VERSION_MINIMUM=3.5   # both SRT trees declare cmake_minimum_required < 3.5; the env var also reaches sub-cmakes
 JOBS=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
 CMAKE_FLAGS="-G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DENABLE_SHARED=OFF -DENABLE_STATIC=ON -DENABLE_ENCRYPTION=OFF -DENABLE_APPS=OFF -DENABLE_UNITTESTS=OFF"
+# CMAKE_EXTRA adds options for the receiver variants, e.g. CMAKE_EXTRA="-DENABLE_HEAVY_LOGGING=ON" for loss traces
+CMAKE_FLAGS="$CMAKE_FLAGS ${CMAKE_EXTRA:-}"
 command -v ninja >/dev/null 2>&1 || CMAKE_FLAGS=$(echo "$CMAKE_FLAGS" | sed 's/-G Ninja //')
 mkdir -p "$B"
 

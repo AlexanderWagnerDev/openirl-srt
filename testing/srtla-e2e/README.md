@@ -51,6 +51,7 @@ socket, so the receiver sees distinct link addresses like it would with real mod
 | `compare.py` | one table per scenario, variants side by side |
 | `repeats_table.py` | aggregate a scenario over several seeds |
 | `holes.py` | recovery-time (ACK lag) distribution from the sender's 20 ms buffer trace |
+| `losstrace.py` | per-dropped-packet timelines (detect, requests, recovery) from a heavy-logging receiver log |
 | `Dockerfile`, `docker.sh` | run build and matrix under Linux, where eight loopback addresses give any number of links |
 
 ## Requirements
@@ -88,6 +89,11 @@ application gaps, one-way latency percentiles, per-link SRTLA stats) and `proxy.
 link and second: forwarded / lost / queue-dropped packets, current impairment).
 
 Ports 15000-17000 are used; `test-srt` uses 5000+, so both can run at once (mind the CPU).
+
+Loss traces: `CMAKE_EXTRA=-DENABLE_HEAVY_LOGGING=ON ./build.sh head=.` builds a receiver that
+logs every loss record's detection, requests and recovery, `RECEIVER_DEBUG=1 ./run_matrix.py ...`
+runs it at debug level, and `./losstrace.py results/<out>/<scenario>/head/rcv.err` builds the
+per-dropped-packet timelines. Both variables pass through `docker.sh`.
 
 `build/wt/<name>` are git worktrees of this repository (`git worktree remove build/wt/<name>`
 to drop one). Keep the machine otherwise idle during runs: a 1-2 s stall of the host shows up
@@ -181,4 +187,5 @@ is read-only there).
   shows here.
 - `lag p99`: ACK lag, the age of the oldest unacknowledged packet (from the 20 ms trace), i.e.
   how long the oldest hole stayed open. `stall`: longest gap between proxy ticks; a host stall
-  invalidates the run.
+  invalidates the run. `exit.json` records the exit code of all four processes; a run whose
+  stream died early is excluded from the score the same way.
