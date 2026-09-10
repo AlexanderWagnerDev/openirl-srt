@@ -529,11 +529,15 @@ srt::SrtlaRec::Ingress srt::SrtlaRec::onIngress(const sockaddr_any& src, CUnit* 
         // not the rexmit flag: a retransmit the receiver never got is still new.
         const int32_t sn     = int32_t(w0 & 0x7FFFFFFF);
         const bool    is_new = trackSn(*g, sn);
+        // A retransmission carries the original packet's timestamp, so it would measure the age
+        // of the loss, not the link: under 20 % loss that inflated the spread to seconds and
+        // pinned the hold at its cap. Retransmissions count as unique data but not as transit samples.
+        const bool    rexmit = (pkt.getHeader()[SRT_PH_MSGNO] & MSGNO_REXMIT::mask) != 0;
         if (is_new)
-        {
             l->unique_acc += double(total); // wire bytes, same basis as recv_acc (decayed above)
-
-            // Relative one-way transit (new packets only). rel = (arrival - arrival_ref)
+        if (is_new && !rexmit)
+        {
+            // Relative one-way transit (new original packets only). rel = (arrival - arrival_ref)
             // - (sender_ts - ts_ref); the sender clock offset cancels. Sender timestamp
             // unwrapped with signed 32-bit deltas (wrap- and reorder-safe).
             const uint32_t sender_ts = pkt.getHeader()[SRT_PH_TIMESTAMP];

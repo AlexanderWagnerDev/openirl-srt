@@ -10634,6 +10634,8 @@ int srt::CUDT::processData(CUnit* in_unit)
                 {
                     // The LOSSREPORT will be sent after initial_loss_ttl.
                     m_FreshLoss.push_back(CRcvFreshLoss(i->first, i->second, initial_loss_ttl));
+                    HLOGC(qrlog.Debug, log << CONID() << "SRTLA LOSSTRACE detect %" << i->first << "-%" << i->second
+                            << " witness %" << packet.seqno());
                 }
             }
         }
@@ -10983,6 +10985,9 @@ void srt::CUDT::unlose(const CPacket &packet)
     if (CRcvFreshLoss::removeOne((m_FreshLoss), sequence, (&had_ttl), (&detect_time)))
     {
         HLOGC(qrlog.Debug, log << "sequence " << sequence << " removed from belated lossreport record");
+        HLOGC(qrlog.Debug, log << CONID() << "SRTLA LOSSTRACE recovered %" << sequence << " after "
+                << (is_zero(detect_time) ? -1 : count_microseconds(steady_clock::now() - detect_time) / 1000) << " ms "
+                << (packet.getRexmitFlag() ? "retransmission" : "original"));
 
         if (m_config.bSRTLA && was_reordered && !is_zero(detect_time))
         {
@@ -11645,6 +11650,10 @@ int srt::CUDT::checkNAKTimer(const steady_clock::time_point& currtime)
                 {
                     CRcvFreshLoss& rec = m_FreshLoss[plan.report[k]];
                     addLossRecord(lossdata, rec.seq[0], rec.seq[1]);
+                    HLOGC(qrlog.Debug, log << CONID() << "SRTLA LOSSTRACE request " << (is_zero(rec.report_time) ? "first" : "repeat")
+                            << " %" << rec.seq[0] << "-%" << rec.seq[1] << " age " << (count_microseconds(currtime - rec.timestamp) / 1000)
+                            << " ms remaining " << ((np.budget_us - count_microseconds(currtime - rec.timestamp) - np.rtt_us - np.margin_us) / 1000)
+                            << " ms hold " << (np.hold_us / 1000) << " ms spacing " << (np.spacing_us / 1000) << " ms");
                     rec.report_time = currtime;
                 }
                 confirmed_loss = plan.confirmed;
