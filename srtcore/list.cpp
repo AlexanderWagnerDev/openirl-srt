@@ -979,11 +979,18 @@ bool srtlaNakEligible(const srt::CRcvFreshLoss&                  rec,
     if (age_us < params.hold_us)
         return false; // still within the reordering grace period
 
-    // No round trip fits in what is left of the play budget.
-    if (params.budget_us > 0 && age_us + params.rtt_us + params.margin_us > params.budget_us)
-        return false;
+    // What is left of the play budget for one more round trip.
+    const int64_t remaining_us = params.budget_us > 0 ? params.budget_us - age_us - params.rtt_us - params.margin_us : 1;
+    if (remaining_us < 0)
+        return false; // no round trip fits any more
 
-    if (!first_report && count_microseconds(now - rec.report_time) < params.spacing_us)
+    int64_t spacing_us = params.spacing_us;
+    // The closer the play deadline, the sooner a repeat. With plenty of budget left the normal
+    // spacing applies (few duplicates); once only a couple of round trips fit, repeat at half the
+    // remaining time so at least two more attempts can be made before the deadline.
+    if (remaining_us > 0 && remaining_us / 2 < spacing_us)
+        spacing_us = std::max<int64_t>(remaining_us / 2, 50000);
+    if (!first_report && count_microseconds(now - rec.report_time) < spacing_us)
         return false; // repeat not due yet
 
     return true;
@@ -1008,6 +1015,7 @@ srt::SrtlaNakPlan srt::srtlaPlanNak(const std::deque<CRcvFreshLoss>&      fresh,
         {
             ++plan.retire;
         }
+
     }
 
     size_t used = 0; // 32-bit words already claimed in the report

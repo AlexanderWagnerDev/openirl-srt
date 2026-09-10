@@ -271,6 +271,10 @@ const uint32_t SRTLA_HOLD_FALLBACK_US        = 250000;
 const uint32_t SRTLA_HOLD_EVIDENCE_MARGIN_US = 30000;
 const int64_t  SRTLA_HOLD_DECAY_TAU_US       = 20000000;
 const int      SRTLA_MIN_RCVLATENCY_MS       = 1000;
+// Under SRTLA the NAK timer is the only loss-report emitter and the hold already paces the
+// reports, so it runs at a fixed short period: the stock (SRTT + 4 RTTVar) / 2 would turn the
+// inter-link RTT variance of a bond into a hidden reorder tolerance.
+const int64_t  SRTLA_NAK_PERIOD_US           = 20000;
 const int64_t  SRTLA_DEADLINE_MARGIN_US      = 30000;
 
 // Sampling window for pctSndQuality / pctRcvQuality.
@@ -405,8 +409,17 @@ srt::CUDT::CUDT(CUDTSocket* parent, const CUDT& ancestor)
     m_SrtHsSide         = ancestor.m_SrtHsSide; // actually it sets it to HSD_RESPONDER
     m_bTLPktDrop        = ancestor.m_bTLPktDrop;
     m_iReorderTolerance = m_config.iMaxReorderTolerance;  // Initialize with maximum value
+
+    // SRTLA protocol rule: the receiver latency is never below SRTLA_MIN_RCVLATENCY_MS.
+    // The reorder hold may grow to half the latency (capped at 500 ms) and one recovery
+    // round trip has to fit behind it, so anything lower cannot be served. Raise-only; the
+    // raised value reaches the sender through the handshake response as its peer latency.
     if (m_config.bSRTLA && m_config.iRcvLatency < SRTLA_MIN_RCVLATENCY_MS)
-        m_config.iRcvLatency = SRTLA_MIN_RCVLATENCY_MS; // SRTLA minimum receiver latency
+    {
+        LOGC(cnlog.Note, log << CONID() << "SRTLA: receiver latency " << m_config.iRcvLatency
+                << " ms is below the protocol minimum, raised to " << SRTLA_MIN_RCVLATENCY_MS << " ms");
+        m_config.iRcvLatency = SRTLA_MIN_RCVLATENCY_MS;
+    }
 
     // Runtime
     m_pCache = ancestor.m_pCache;
@@ -11606,6 +11619,7 @@ int srt::CUDT::checkNAKTimer(const steady_clock::time_point& currtime)
 
             vector<int32_t> lossdata;
             int             confirmed_loss = 0;
+            int64_t         dbg_hold_us = 0, dbg_spacing_us = 0; size_t dbg_records = 0; // for the debug log below
             {
                 ScopedLock lk(m_RcvLossLock);
 
@@ -11613,9 +11627,10 @@ int srt::CUDT::checkNAKTimer(const steady_clock::time_point& currtime)
 
                 SrtlaNakParams np;
                 np.hold_us    = srtlaReorderHoldUs(currtime);
-                // A round trip plus the reorder spread: SRTT tracks the fastest path,
-                // the retransmission may travel the slowest.
-                np.spacing_us = std::max<int64_t>(srtt_us + np.hold_us,
+                // A round trip plus the measured link spread: SRTT tracks the fastest path, the
+                // retransmission may travel the slowest. The floored, evidence-raised hold is
+                // deliberately not used here (it doubled the wait under load).
+                np.spacing_us = std::max<int64_t>(srtt_us + std::max<int64_t>(m_uiSrtlaHoldSteadyUs.load(), 20000),
                         count_microseconds(m_tdNAKInterval));
                 // No TSBPD means no play deadline and no TLPKTDROP: deadline handling off.
                 np.budget_us  = m_bTsbPd ? (int64_t)m_iTsbPdDelay_ms * 1000 : 0;
@@ -11633,6 +11648,7 @@ int srt::CUDT::checkNAKTimer(const steady_clock::time_point& currtime)
                     rec.report_time = currtime;
                 }
                 confirmed_loss = plan.confirmed;
+                dbg_hold_us = np.hold_us; dbg_spacing_us = np.spacing_us; dbg_records = plan.report.size();
 
                 // The indices above address the untouched container, so retire only now.
                 if (plan.retire > 0)
@@ -11648,6 +11664,9 @@ int srt::CUDT::checkNAKTimer(const steady_clock::time_point& currtime)
                 sendCtrl(UMSG_LOSSREPORT, NULL, &lossdata[0], (int)lossdata.size());
                 countConfirmedLoss(confirmed_loss);
                 debug_decision = BECAUSE_NAKREPORT;
+                HLOGC(qrlog.Debug, log << CONID() << "SRTLA: loss report with " << dbg_records << " record(s), hold "
+                        << (dbg_hold_us / 1000) << " ms, spacing " << (dbg_spacing_us / 1000) << " ms, timer period "
+                        << count_milliseconds(m_tdNAKInterval) << " ms");
             }
         }
         else
@@ -11657,7 +11676,10 @@ int srt::CUDT::checkNAKTimer(const steady_clock::time_point& currtime)
         }
     }
 
-    m_tsNextNAKTime.store(currtime + m_tdNAKInterval);
+    steady_clock::duration next = m_tdNAKInterval;
+    if (srtla_emitter && next > microseconds_from(SRTLA_NAK_PERIOD_US))
+        next = microseconds_from(SRTLA_NAK_PERIOD_US);
+    m_tsNextNAKTime.store(currtime + next);
     return debug_decision;
 }
 

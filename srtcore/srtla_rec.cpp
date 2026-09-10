@@ -12,6 +12,7 @@
 #include "platform_sys.h"
 
 #include <algorithm>
+#include <vector>
 #include <random>
 
 #include "srtla_rec.h"
@@ -801,34 +802,27 @@ uint32_t srt::SrtlaRec::holdSteadyUs(SRTSOCKET socket_id)
 
     const time_point now = steady_clock::now();
 
-    double tmin = 0.0, tmax = 0.0, jmax = 0.0;
-    bool   have = false;
+    std::vector<double> transit, jitter;
     for (std::list<Link>::iterator it = grp->links.begin(); it != grp->links.end(); ++it)
     {
         // transit_ewma only advances on arriving data, so a stale one is not a current
         // measurement and must not widen the spread.
         if (!it->transit_valid || count_microseconds(now - it->last_transit) > LINK_FRESH_US)
             continue;
-
-        if (!have)
-        {
-            tmin = tmax = it->transit_ewma;
-            have = true;
-        }
-        else
-        {
-            if (it->transit_ewma < tmin)
-                tmin = it->transit_ewma;
-            if (it->transit_ewma > tmax)
-                tmax = it->transit_ewma;
-        }
-        if (it->jitter_ewma > jmax)
-            jmax = it->jitter_ewma;
+        transit.push_back(it->transit_ewma);
+        jitter.push_back(it->jitter_ewma);
     }
-    if (!have)
+    if (transit.empty())
         return 0;
-
+    // The slowest link the hold waits for: a link that is late by more than the cap is not
+    // covered and gets starved by the sender's own loss penalties, links inside it stay in the
+    // bond. (A median-of-links policy was measured end to end and rejected.)
+    const double tmin = *std::min_element(transit.begin(), transit.end());
+    const double tmax = *std::max_element(transit.begin(), transit.end());
+    const double jmax = *std::max_element(jitter.begin(), jitter.end());
     double hold = (tmax - tmin) + 4.0 * jmax;
+    HLOGC(qrlog.Debug, log << "SRTLA hold: " << transit.size() << " fresh links, spread " << ((tmax - tmin) / 1000.0)
+            << " ms, jitter " << (jmax / 1000.0) << " ms -> steady " << (hold / 1000.0) << " ms");
     if (hold < 0.0)
         hold = 0.0;
     if (hold > 10e6)

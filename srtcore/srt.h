@@ -236,8 +236,10 @@ typedef enum SRT_SOCKOPT {
 
    SRTO_SRTLA = 120, // On a listener: designate an SRTLA (link-aggregation) demux listener.
                      // Inherited by accepted connections, where it also enables the SRTLA
-                     // multipath delivery tuning (retransmit-flag / ordered-delivery heuristics).
-                     // (Formerly SRTO_SRTLAPATCHES.)
+                     // multipath delivery tuning (retransmit-flag / ordered-delivery heuristics)
+                     // and enforces the SRTLA minimum receiver latency of 1000 ms: a lower
+                     // SRTO_RCVLATENCY / SRTO_LATENCY is raised on accept and the raised value
+                     // is negotiated to the sender. (Formerly SRTO_SRTLAPATCHES.)
 
    SRTO_E_SIZE // Always last element, not a valid option.
 } SRT_SOCKOPT;
