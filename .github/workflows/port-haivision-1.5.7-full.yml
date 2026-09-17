@@ -1,0 +1,53 @@
+name: Port full OpenIRL SRTLA stack to Haivision 1.5.7
+
+on:
+  push:
+    paths:
+      - .github/workflows/port-haivision-1.5.7-full.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  merge-probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Probe full OpenIRL .3 merge
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add haivision https://github.com/Haivision/srt.git 2>/dev/null || true
+          git fetch --force haivision refs/tags/v1.5.7:refs/tags/v1.5.7
+          git fetch --force origin 'refs/tags/v1.5.4+openirl.3:refs/tags/v1.5.4+openirl.3'
+          git checkout -B port/openirl-1.5.7-full refs/tags/v1.5.7
+
+          set +e
+          git merge --no-ff --no-commit refs/tags/v1.5.4+openirl.3
+          status=$?
+          set -e
+
+          if [ "$status" -ne 0 ]; then
+            echo "::group::Conflicted files"
+            git diff --name-only --diff-filter=U
+            echo "::endgroup::"
+            echo "::group::Conflict hunks"
+            git diff --cc || true
+            echo "::endgroup::"
+            git checkout --conflict=diff3 -- . || true
+            git add -A
+            git commit -m "WIP: expose full OpenIRL .3 / Haivision 1.5.7 conflicts" || true
+            git push --force origin HEAD:refs/heads/port/openirl-1.5.7-full-conflicts
+            exit 1
+          fi
+
+          git diff --check
+          git commit -m "Merge full OpenIRL SRTLA stack onto Haivision SRT 1.5.7"
+          git push --force origin HEAD:refs/heads/port/openirl-1.5.7-full
