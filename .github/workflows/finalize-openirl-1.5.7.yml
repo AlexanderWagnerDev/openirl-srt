@@ -1,0 +1,194 @@
+name: Finalize OpenIRL SRTLA on Haivision 1.5.7
+
+on:
+  push:
+    paths:
+      - .github/workflows/finalize-openirl-1.5.7.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  port-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Port OpenIRL .3 onto SRT 1.5.7
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add haivision https://github.com/Haivision/srt.git 2>/dev/null || true
+          git fetch --force haivision refs/tags/v1.5.7:refs/tags/v1.5.7
+          git fetch --force origin 'refs/tags/v1.5.4+openirl.3:refs/tags/v1.5.4+openirl.3'
+          git checkout -B port/openirl-1.5.7-full refs/tags/v1.5.7
+
+          set +e
+          git merge --no-ff --no-commit refs/tags/v1.5.4+openirl.3
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            echo "Expected known conflicts but merge completed cleanly; refusing to apply stale resolver."
+            exit 1
+          fi
+
+          conflicts="$(git diff --name-only --diff-filter=U)"
+          expected=$'srtcore/core.cpp\nsrtcore/core.h\nsrtcore/queue.cpp\ntest/test_common.cpp'
+          test "$conflicts" = "$expected" || { printf 'Unexpected conflicts:\n%s\n' "$conflicts"; exit 1; }
+          git checkout --conflict=diff3 -- srtcore/core.cpp srtcore/core.h srtcore/queue.cpp test/test_common.cpp
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          def split(path):
+              p=Path(path); t=p.read_text()
+              a,r=t.split('<<<<<<< ours\n',1)
+              ours,r=r.split('||||||| base\n',1)
+              _,r=r.split('=======\n',1)
+              theirs,z=r.split('>>>>>>> theirs\n',1)
+              return p,a,ours,theirs,z
+
+          p,a,o,t,z=split('srtcore/core.cpp')
+          text=a+o.rstrip()+'\n\n'+t.lstrip()+z
+          old='np.cap        = (size_t)m_iMaxSRTPayloadSize / 4;'
+          new='np.cap        = (size_t)m_iMaxDataPayloadSize / sizeof(int32_t);'
+          if old not in text: raise SystemExit('NAK payload compatibility anchor missing')
+          p.write_text(text.replace(old,new,1))
+
+          p,a,o,t,z=split('srtcore/core.h')
+          compat='''    /// Record packets that are being requested back for the first time, that is,
+              /// that were still missing once the reorder grace period was over. Feeds
+              /// pctRcvQuality. NAK repeats must not be passed here.
+              /// Takes m_StatsLock, so the caller must not hold it.
+              /// @param pkts number of sequence numbers confirmed as lost
+              void countConfirmedLoss(int pkts);
+
+              bool processCtrl(const CPacket& ctrlpkt);
+
+          '''
+          p.write_text(a+compat+z)
+
+          p,a,o,t,z=split('srtcore/queue.cpp')
+          p.write_text(a+o+z)
+
+          qh=Path('srtcore/queue.h'); text=qh.read_text()
+          pat=re.compile(r'    ~CMultiplexer\(\)\n    \{\n        if \(m_pRcvQueue != NULL\)\n            delete m_pRcvQueue;\n        if \(m_pSndQueue != NULL\)\n            delete m_pSndQueue;\n        if \(m_pTimer != NULL\)\n            delete m_pTimer;\n        close\(\);\n    \}\n')
+          text,n=pat.subn('    ~CMultiplexer();\n',text,count=1)
+          if n!=1: raise SystemExit('CMultiplexer destructor anchor missing')
+          qh.write_text(text)
+
+          qc=Path('srtcore/queue.cpp'); text=qc.read_text(); anchor='void srt::CMultiplexer::resetAtFork()\n'
+          dtor='''srt::CMultiplexer::~CMultiplexer()
+          {
+              if (m_pRcvQueue != NULL) delete m_pRcvQueue;
+              if (m_pSndQueue != NULL) delete m_pSndQueue;
+              if (m_pSrtlaRec != NULL) delete m_pSrtlaRec;
+              if (m_pTimer != NULL) delete m_pTimer;
+              close();
+          }
+
+          '''
+          if anchor not in text: raise SystemExit('resetAtFork anchor missing')
+          qc.write_text(text.replace(anchor,dtor+anchor,1))
+
+          p,a,o,t,z=split('test/test_common.cpp')
+          p.write_text(a+o.rstrip()+'\n'+t.lstrip()+z)
+
+          # Keep the complete .3 API and add only source-compatibility fields used by SLS 1.5.2.
+          sh=Path('srtcore/srt.h'); text=sh.read_text()
+          peer_end='    uint64_t establishedMs;     // link start, demux monotonic milliseconds\n} SRT_SRTLA_PEER_STATS;'
+          peer_new='''    uint64_t establishedMs;     // link start, demux monotonic milliseconds
+
+              // Legacy OpenIRL source compatibility for srt-live-server 1.5.2.
+              uint32_t bitrate;
+              uint32_t jitter;
+              uint64_t bytesReceived;
+              uint32_t uptime;
+              uint32_t throughput;
+          } SRT_SRTLA_PEER_STATS;'''
+          if peer_end not in text: raise SystemExit('peer stats anchor missing')
+          text=text.replace(peer_end,peer_new,1)
+          stats_end='    SRT_SRTLA_PEER_STATS peers[SRT_SRTLA_MAX_PEERS];\n} SRT_SRTLA_STATS;'
+          stats_new='''    SRT_SRTLA_PEER_STATS peers[SRT_SRTLA_MAX_PEERS];
+
+              // Legacy OpenIRL source compatibility for srt-live-server 1.5.2.
+              uint32_t totalBitrate;
+              uint64_t timestamp;
+          } SRT_SRTLA_STATS;'''
+          if stats_end not in text: raise SystemExit('aggregate stats anchor missing')
+          text=text.replace(stats_end,stats_new,1)
+          # Old SLS enables the old option name. Route it to the integrated .3 receiver.
+          opt_anchor='} SRT_SOCKOPT;'
+          if opt_anchor not in text: raise SystemExit('sockopt anchor missing')
+          text=text.replace(opt_anchor,'} SRT_SOCKOPT;\n\n#ifndef SRTO_SRTLAPATCHES\n#define SRTO_SRTLAPATCHES SRTO_SRTLA\n#endif',1)
+          sh.write_text(text)
+
+          rc=Path('srtcore/srtla_rec.cpp'); text=rc.read_text()
+          hdr='    out->valid = 1;\n    out->nowMs = uint64_t(count_milliseconds(now.time_since_epoch()));'
+          hdr_new=hdr+'\n    out->timestamp = out->nowMs;\n    out->totalBitrate = 0;'
+          if hdr not in text: raise SystemExit('fillStats header anchor missing')
+          text=text.replace(hdr,hdr_new,1)
+          peer='''        out->peers[i].connectionId   = it->connectionId;
+                  out->peers[i].kbpsRecvRate   = uint32_t(it->recv_acc   * decay * 8.0 / 1000.0);
+                  out->peers[i].kbpsRecvUnique = uint32_t(it->unique_acc * decay * 8.0 / 1000.0);
+                  out->peers[i].transitUs      = int32_t(it->transit_ewma);
+                  out->peers[i].usJitter       = uint32_t(it->jitter_ewma);
+                  out->peers[i].establishedMs  = uint64_t(count_milliseconds(it->established.time_since_epoch()));'''
+          peer_new=peer+'''
+
+                  out->peers[i].bitrate = out->peers[i].kbpsRecvUnique;
+                  out->peers[i].throughput = out->peers[i].kbpsRecvRate;
+                  out->peers[i].jitter = out->peers[i].usJitter;
+                  out->peers[i].bytesReceived = 0;
+                  const uint64_t uptime_ms = out->nowMs > out->peers[i].establishedMs ? out->nowMs - out->peers[i].establishedMs : 0;
+                  out->peers[i].uptime = uint32_t((uptime_ms / 1000) > 0xffffffffu ? 0xffffffffu : (uptime_ms / 1000));
+                  out->totalBitrate += out->peers[i].bitrate;'''
+          if peer not in text: raise SystemExit('fillStats peer anchor missing')
+          rc.write_text(text.replace(peer,peer_new,1))
+
+          for f in ['srtcore/core.cpp','srtcore/core.h','srtcore/queue.cpp','srtcore/queue.h','test/test_common.cpp']:
+              x=Path(f).read_text()
+              if any(m in x for m in ('<<<<<<<','|||||||','=======','>>>>>>>')): raise SystemExit('conflict marker in '+f)
+          PY
+
+          git add -A
+          git diff --cached --check
+          git commit -m "Port full OpenIRL SRTLA stack onto Haivision SRT 1.5.7"
+
+      - name: Verify required APIs
+        run: |
+          set -euo pipefail
+          grep -q 'SRTO_SRTLA = 120' srtcore/srt.h
+          grep -q 'define SRTO_SRTLAPATCHES SRTO_SRTLA' srtcore/srt.h
+          grep -q 'SRT_SRTLA_STATS' srtcore/srt.h
+          grep -q 'uint32_t totalBitrate' srtcore/srt.h
+          grep -q 'SRTLA_MIN_RCVLATENCY_MS' srtcore/core.cpp
+          grep -q 'SRTLA_NAK_PERIOD_US' srtcore/core.cpp
+          grep -q 'm_iMaxDataPayloadSize / sizeof(int32_t)' srtcore/core.cpp
+          test -f srtcore/srtla_rec.cpp
+
+      - name: Build libsrt and tests
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake g++ make pkg-config tclsh libssl-dev zlib1g-dev libsqlite3-dev
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_SHARED=ON -DENABLE_UNITTESTS=ON
+          cmake --build build --parallel 2
+          sudo cmake --install build
+          sudo ldconfig
+          ctest --test-dir build --output-on-failure
+
+      - name: Build OpenIRL srt-live-server 1.5.2
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch 1.5.2 https://github.com/OpenIRL/srt-live-server.git /tmp/sls
+          make -C /tmp/sls -j2
+
+      - name: Publish PR branch
+        run: git push --force origin HEAD:refs/heads/port/openirl-1.5.7-full
