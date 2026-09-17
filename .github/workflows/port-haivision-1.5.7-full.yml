@@ -162,6 +162,134 @@ jobs:
           git diff --check
           git commit -m "Merge full OpenIRL SRTLA stack onto Haivision SRT 1.5.7"
 
+      - name: Preserve legacy SRTLA stats API for SLS 1.5.2
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          # OpenIRL .3 modernized the SRTLA stats layout. Keep those fields unchanged,
+          # but append the .1-era field names used by OpenIRL srt-live-server 1.5.2.
+          sh = Path("srtcore/srt.h")
+          text = sh.read_text()
+          old = """    uint64_t establishedMs;     // link start, demux monotonic milliseconds
+          } SRT_SRTLA_PEER_STATS;
+          """
+          new = """    uint64_t establishedMs;     // link start, demux monotonic milliseconds
+
+              // Legacy OpenIRL stats fields retained for source compatibility with
+              // srt-live-server 1.5.2. New consumers should use the fields above.
+              uint32_t bitrate;            // alias of kbpsRecvUnique
+              uint32_t jitter;             // alias of usJitter
+              uint64_t bytesReceived;      // cumulative received wire bytes
+              uint32_t uptime;             // seconds since this link was established
+              uint32_t throughput;         // alias of kbpsRecvRate
+          } SRT_SRTLA_PEER_STATS;
+          """
+          if old not in text:
+              raise SystemExit("SRT_SRTLA_PEER_STATS layout changed unexpectedly")
+          text = text.replace(old, new, 1)
+
+          old = """    SRT_SRTLA_PEER_STATS peers[SRT_SRTLA_MAX_PEERS];
+          } SRT_SRTLA_STATS;
+          """
+          new = """    SRT_SRTLA_PEER_STATS peers[SRT_SRTLA_MAX_PEERS];
+
+              // Legacy OpenIRL aggregate fields retained for SLS 1.5.2.
+              uint32_t totalBitrate;        // sum of per-link unique receive rates
+              uint64_t timestamp;           // alias of nowMs
+          } SRT_SRTLA_STATS;
+          """
+          if old not in text:
+              raise SystemExit("SRT_SRTLA_STATS layout changed unexpectedly")
+          sh.write_text(text.replace(old, new, 1))
+
+          # Track the legacy cumulative bytesReceived value without changing the .3
+          # rate estimators or their semantics.
+          rh = Path("srtcore/srtla_rec.h")
+          text = rh.read_text()
+          old = """        double     unique_acc;         // first-seen (non-duplicate) wire bytes
+              time_point rate_last;
+          """
+          new = """        double     unique_acc;         // first-seen (non-duplicate) wire bytes
+              uint64_t   bytes_received_total; // cumulative wire bytes for legacy stats
+              time_point rate_last;
+          """
+          if old not in text:
+              raise SystemExit("SrtlaRec Link rate fields changed unexpectedly")
+          text = text.replace(old, new, 1)
+          old = """            , unique_acc(0.0)
+                  , rate_init(false)
+          """
+          new = """            , unique_acc(0.0)
+                  , bytes_received_total(0)
+                  , rate_init(false)
+          """
+          if old not in text:
+              raise SystemExit("SrtlaRec Link constructor changed unexpectedly")
+          rh.write_text(text.replace(old, new, 1))
+
+          rc = Path("srtcore/srtla_rec.cpp")
+          text = rc.read_text()
+          old = """    Group* g = ref.g;
+              Link*  l = ref.l;
+          """
+          new = """    Group* g = ref.g;
+              Link*  l = ref.l;
+              l->bytes_received_total += uint64_t(total);
+          """
+          if old not in text:
+              raise SystemExit("SrtlaRec ingress membership block changed unexpectedly")
+          text = text.replace(old, new, 1)
+
+          old = """    out->valid = 1;
+              out->nowMs = uint64_t(count_milliseconds(now.time_since_epoch()));
+          """
+          new = """    out->valid = 1;
+              out->nowMs = uint64_t(count_milliseconds(now.time_since_epoch()));
+              out->timestamp = out->nowMs;
+              out->totalBitrate = 0;
+          """
+          if old not in text:
+              raise SystemExit("SrtlaRec fillStats header changed unexpectedly")
+          text = text.replace(old, new, 1)
+
+          old = """        out->peers[i].connectionId   = it->connectionId;
+                  out->peers[i].kbpsRecvRate   = uint32_t(it->recv_acc   * decay * 8.0 / 1000.0);
+                  out->peers[i].kbpsRecvUnique = uint32_t(it->unique_acc * decay * 8.0 / 1000.0);
+                  out->peers[i].transitUs      = int32_t(it->transit_ewma);
+                  out->peers[i].usJitter       = uint32_t(it->jitter_ewma);
+                  out->peers[i].establishedMs  = uint64_t(count_milliseconds(it->established.time_since_epoch()));
+          """
+          new = """        out->peers[i].connectionId   = it->connectionId;
+                  out->peers[i].kbpsRecvRate   = uint32_t(it->recv_acc   * decay * 8.0 / 1000.0);
+                  out->peers[i].kbpsRecvUnique = uint32_t(it->unique_acc * decay * 8.0 / 1000.0);
+                  out->peers[i].transitUs      = int32_t(it->transit_ewma);
+                  out->peers[i].usJitter       = uint32_t(it->jitter_ewma);
+                  out->peers[i].establishedMs  = uint64_t(count_milliseconds(it->established.time_since_epoch()));
+
+                  // Populate the legacy view from the modern .3 measurements.
+                  out->peers[i].bitrate       = out->peers[i].kbpsRecvUnique;
+                  out->peers[i].throughput    = out->peers[i].kbpsRecvRate;
+                  out->peers[i].jitter        = out->peers[i].usJitter;
+                  out->peers[i].bytesReceived = it->bytes_received_total;
+                  const uint64_t uptime_ms = out->nowMs > out->peers[i].establishedMs
+                      ? out->nowMs - out->peers[i].establishedMs : 0;
+                  const uint64_t uptime_s = uptime_ms / 1000;
+                  out->peers[i].uptime = uptime_s > uint64_t(0xffffffffu)
+                      ? 0xffffffffu : uint32_t(uptime_s);
+                  out->totalBitrate += out->peers[i].bitrate;
+          """
+          if old not in text:
+              raise SystemExit("SrtlaRec fillStats peer block changed unexpectedly")
+          rc.write_text(text.replace(old, new, 1))
+          PY
+
+          git add srtcore/srt.h srtcore/srtla_rec.h srtcore/srtla_rec.cpp
+          git diff --cached --check
+          git commit -m "compat: retain legacy SRTLA stats fields for SLS 1.5.2"
+
       - name: Verify full OpenIRL .3 API/features are present
         shell: bash
         run: |
@@ -173,6 +301,10 @@ jobs:
           grep -q 'SRTLA_NAK_PERIOD_US' srtcore/core.cpp
           grep -q 'countConfirmedLoss' srtcore/core.cpp
           grep -q 'm_iMaxDataPayloadSize / sizeof(int32_t)' srtcore/core.cpp
+          grep -q 'uint32_t totalBitrate' srtcore/srt.h
+          grep -q 'uint32_t bitrate' srtcore/srt.h
+          grep -q 'uint32_t throughput' srtcore/srt.h
+          grep -q 'bytes_received_total' srtcore/srtla_rec.h
           test -f srtcore/srtla_rec.cpp
           test -f srtcore/srtla_rec.h
 
@@ -204,10 +336,8 @@ jobs:
           git clone --depth 1 --branch 1.5.2 https://github.com/OpenIRL/srt-live-server.git /tmp/srt-live-server
           make -C /tmp/srt-live-server -j2
 
-      - name: Publish tested branch and compatibility tag
+      - name: Publish tested PR branch
         shell: bash
         run: |
           set -euo pipefail
           git push --force origin HEAD:refs/heads/port/openirl-1.5.7-full
-          git tag -f -a v1.5.7+openirl.3 -m "Full OpenIRL SRTLA stack on Haivision SRT 1.5.7"
-          git push --force origin refs/tags/v1.5.7+openirl.3
