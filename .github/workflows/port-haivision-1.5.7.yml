@@ -18,7 +18,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Merge OpenIRL compatibility patch set onto Haivision 1.5.7
+      - name: Port OpenIRL compatibility patch set onto Haivision 1.5.7
         shell: bash
         run: |
           set -euo pipefail
@@ -37,21 +37,107 @@ jobs:
           set -e
 
           if [ "$merge_status" -ne 0 ]; then
-            echo "::group::Conflicted files"
-            git diff --name-only --diff-filter=U
-            echo "::endgroup::"
+            conflicts="$(git diff --name-only --diff-filter=U)"
+            expected=$'srtcore/core.cpp\nsrtcore/core.h'
+            if [ "$conflicts" != "$expected" ]; then
+              echo "Unexpected merge conflicts:"
+              printf '%s\n' "$conflicts"
+              git diff --cc || true
+              exit 1
+            fi
 
-            echo "::group::Conflict hunks"
-            git diff --cc || true
-            echo "::endgroup::"
+            python3 - <<'PY'
+          from pathlib import Path
 
-            # Preserve a debuggable snapshot with diff3 conflict markers.
-            git checkout --conflict=diff3 -- . || true
-            git add -A
-            git commit -m "WIP: expose OpenIRL/Haivision 1.5.7 merge conflicts" || true
-            git push --force origin HEAD:refs/heads/port/openirl-1.5.7-conflicts
-            exit 1
+          core = Path("srtcore/core.cpp")
+          text = core.read_text()
+          old = """<<<<<<< HEAD
+              // Will be updated on first send
+          #ifdef ENABLE_MAXREXMITBW
+              m_zSndAveragePacketSize = 0;
+              m_zSndMaxPacketSize = 0;
+          #endif
+
+              // Initialize mutex and condition variables.
+          =======
+              memset(&m_SrtlaStats, 0, sizeof(m_SrtlaStats));
+
+              // Initilize mutex and condition variables.
+          >>>>>>> refs/tags/v1.5.4+openirl.1"""
+          new = """    // Will be updated on first send
+          #ifdef ENABLE_MAXREXMITBW
+              m_zSndAveragePacketSize = 0;
+              m_zSndMaxPacketSize = 0;
+          #endif
+
+              memset(&m_SrtlaStats, 0, sizeof(m_SrtlaStats));
+
+              // Initialize mutex and condition variables."""
+          if old not in text:
+              raise SystemExit("core.cpp conflict block changed unexpectedly")
+          core.write_text(text.replace(old, new, 1))
+
+          hdr = Path("srtcore/core.h")
+          text = hdr.read_text()
+          old = """<<<<<<< HEAD
+              bool processCtrl(const CPacket& ctrlpkt);
+          =======
+              void processCtrl(const CPacket& ctrlpkt);
+              void processSrtlaStats(const CPacket& ctrlpkt);
+          >>>>>>> refs/tags/v1.5.4+openirl.1"""
+          new = """    bool processCtrl(const CPacket& ctrlpkt);
+              void processSrtlaStats(const CPacket& ctrlpkt);"""
+          if old not in text:
+              raise SystemExit("core.h conflict block changed unexpectedly")
+          hdr.write_text(text.replace(old, new, 1))
+
+          for path in (core, hdr):
+              data = path.read_text()
+              if "<<<<<<<" in data or ">>>>>>>" in data or "=======" in data:
+                  raise SystemExit(f"unresolved conflict marker remains in {path}")
+          PY
+
+            git add srtcore/core.cpp srtcore/core.h
           fi
 
+          git diff --check
           git commit -m "Merge OpenIRL SRTLA compatibility patches onto Haivision SRT 1.5.7"
+
+      - name: Verify legacy OpenIRL SRTLA API is preserved
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q 'SRTO_SRTLAPATCHES' srtcore/srt.h
+          grep -q 'SRT_SRTLA_STATS' srtcore/srt.h
+          grep -q 'srt_srtla_stats' srtcore/srt.h
+          grep -q 'UMSG_SRTLA_STATS' srtcore/common.h
+          grep -q 'processSrtlaStats' srtcore/core.cpp
+
+      - name: Build patched libsrt
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake g++ make pkg-config tclsh libssl-dev zlib1g-dev libsqlite3-dev
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_SHARED=ON
+          cmake --build build --parallel 2
+          sudo cmake --install build
+          sudo ldconfig
+
+      - name: Build OpenIRL srt-live-server 1.5.2 against patched libsrt
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch 1.5.2 https://github.com/OpenIRL/srt-live-server.git /tmp/srt-live-server
+          make -C /tmp/srt-live-server -j2
+
+      - name: Publish tested branch and compatibility tag
+        shell: bash
+        run: |
+          set -euo pipefail
           git push --force origin HEAD:refs/heads/port/openirl-1.5.7
+          git tag -f -a v1.5.7+openirl.1 -m "OpenIRL SRTLA compatibility patches on Haivision SRT 1.5.7"
+          git push --force origin refs/tags/v1.5.7+openirl.1
