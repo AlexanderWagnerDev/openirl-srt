@@ -66,6 +66,7 @@ modified by
 #include "queue.h"
 #include "api.h"
 #include "core.h"
+#include "srtla_rec.h"
 #include "logging.h"
 #include "crypto.h"
 #include "logging_api.h" // Required due to containing extern srt_logger_config
@@ -211,6 +212,8 @@ struct SrtOptionAction
 #ifdef ENABLE_AEAD_API_PREVIEW
         flags[SRTO_CRYPTOMODE]         = SRTO_R_PRE;
 #endif
+
+        flags[SRTO_SRTLA]              = SRTO_R_PRE;
 
         // For "private" options (not derived from the listener
         // socket by an accepted socket) provide below private_default
@@ -387,6 +390,34 @@ void srt::RateMeasurement::pickup(const clock_time& time)
 }
 #endif
 
+// SRTLA loss-report timing parameters (active only with SRTO_SRTLA).
+namespace {
+const int      SRTLA_WITNESS_TTL             = 2;
+const uint32_t SRTLA_HOLD_FLOOR_US           = 100000;
+const uint32_t SRTLA_HOLD_CAP_US             = 500000;
+const uint32_t SRTLA_HOLD_FALLBACK_US        = 250000;
+const uint32_t SRTLA_HOLD_EVIDENCE_MARGIN_US = 30000;
+const int64_t  SRTLA_HOLD_DECAY_TAU_US       = 20000000;
+const int      SRTLA_MIN_RCVLATENCY_MS       = 1000;
+// Under SRTLA the NAK timer is the only loss-report emitter and the hold already paces the
+// reports, so it runs at a fixed short period: the stock (SRTT + 4 RTTVar) / 2 would turn the
+// inter-link RTT variance of a bond into a hidden reorder tolerance.
+const int64_t  SRTLA_NAK_PERIOD_US           = 20000;
+const int64_t  SRTLA_DEADLINE_MARGIN_US      = 30000;
+
+// Sampling window for pctSndQuality / pctRcvQuality.
+const int64_t  QUALITY_WINDOW_US             = 1000000; // 1 s
+
+inline uint32_t srtlaDecayedFastHold(uint32_t stored_us, int64_t age_us)
+{
+    if (stored_us == 0 || age_us >= SRTLA_HOLD_DECAY_TAU_US)
+        return 0;
+    if (age_us <= 0)
+        return stored_us;
+    return (uint32_t)((int64_t)stored_us * (SRTLA_HOLD_DECAY_TAU_US - age_us) / SRTLA_HOLD_DECAY_TAU_US);
+}
+} // namespace
+
 void srt::CUDT::construct()
 {
     m_pSndBuffer           = NULL;
@@ -394,6 +425,8 @@ void srt::CUDT::construct()
     m_pSndLossList         = NULL;
     m_pRcvLossList         = NULL;
     m_iReorderTolerance    = 0;
+    m_uiSrtlaHoldSteadyUs  = 0;
+    m_uiSrtlaHoldFastUs    = 0;
     // How many times so far the packet considered lost has been received
     // before TTL expires.
     m_iConsecEarlyDelivery   = 0; 
@@ -513,6 +546,17 @@ srt::CUDT::CUDT(CUDTSocket* parent, const CUDT& ancestor)
     m_SrtHsSide         = ancestor.m_SrtHsSide; // actually it sets it to HSD_RESPONDER
     m_bTLPktDrop        = ancestor.m_bTLPktDrop;
     m_iReorderTolerance = m_config.iMaxReorderTolerance;  // Initialize with maximum value
+
+    // SRTLA protocol rule: the receiver latency is never below SRTLA_MIN_RCVLATENCY_MS.
+    // The reorder hold may grow to half the latency (capped at 500 ms) and one recovery
+    // round trip has to fit behind it, so anything lower cannot be served. Raise-only; the
+    // raised value reaches the sender through the handshake response as its peer latency.
+    if (m_config.bSRTLA && m_config.iRcvLatency < SRTLA_MIN_RCVLATENCY_MS)
+    {
+        LOGC(cnlog.Note, log << CONID() << "SRTLA: receiver latency " << m_config.iRcvLatency
+                << " ms is below the protocol minimum, raised to " << SRTLA_MIN_RCVLATENCY_MS << " ms");
+        m_config.iRcvLatency = SRTLA_MIN_RCVLATENCY_MS;
+    }
 
     // Runtime
     m_pCache = ancestor.m_pCache;
@@ -990,6 +1034,11 @@ void srt::CUDT::getOpt(SRT_SOCKOPT optName, void *optval, int &optlen)
         break;
 #endif
 
+    case SRTO_SRTLA:
+        optlen          = sizeof(bool);
+        *(bool *)optval = m_config.bSRTLA;
+        break;
+
     default:
         throw CUDTException(MJ_NOTSUP, MN_NONE, 0);
     }
@@ -1068,6 +1117,14 @@ void srt::CUDT::clearData()
         m_stats.traceReorderDistance = 0;
         m_stats.traceBelatedTime = 0;
         m_stats.sndDuration = m_stats.m_sndDurationTotal = 0;
+
+        m_stats.tsQualityWindow      = m_stats.tsStartTime;
+        m_stats.qualBaseSndClean     = 0;
+        m_stats.qualBaseSndImpaired  = 0;
+        m_stats.qualBaseRcvClean     = 0;
+        m_stats.qualBaseRcvImpaired  = 0;
+        m_stats.pctSndQuality        = 100.0;
+        m_stats.pctRcvQuality        = 100.0;
     }
 
     // Resetting these data because this happens when agent isn't connected.
@@ -6090,6 +6147,14 @@ void srt::CUDT::acceptAndRespond(const sockaddr_any& agent, const sockaddr_any& 
 
     m_PeerAddr = peer;
 
+    // SRTLA binding moment: if this connection was accepted on an SRTLA demux
+    // listener, associate the new CUDT with the group whose registered link is
+    // @a peer, so that every link of the group routes here and the reverse path
+    // (ACK/NAK fan-out) can find the group. m_config.bSRTLA is already inherited
+    // from the listener, so the multipath tuning and peer-check relaxation are on.
+    if (m_pRcvQueue && m_pRcvQueue->m_pSrtlaRec)
+        m_pRcvQueue->m_pSrtlaRec->bindGroup(peer, this);
+
     // This should extract the HSREQ and KMREQ portion in the handshake packet.
     // This could still be a HSv4 packet and contain no such parts, which will leave
     // this entity as "non-SRT-handshaken", and await further HSREQ and KMREQ sent
@@ -7791,6 +7856,7 @@ void srt::CUDT::bstats(CBytePerfMon *perf, bool clear, bool instantaneous)
 
         perf->pktSndLoss           = m_stats.sndr.lost.trace.count();
         perf->pktRcvLoss           = m_stats.rcvr.lost.trace.count();
+        perf->pktRcvLossConfirmed  = m_stats.rcvr.lostConfirmed.trace.count();
         perf->pktRetrans           = m_stats.sndr.sentRetrans.trace.count();
         perf->pktRcvRetrans        = m_stats.rcvr.recvdRetrans.trace.count();
         perf->pktSentACK           = m_stats.rcvr.sentAck.trace.count();
@@ -7829,6 +7895,7 @@ void srt::CUDT::bstats(CBytePerfMon *perf, bool clear, bool instantaneous)
         perf->pktRecvUniqueTotal = m_stats.rcvr.recvdUnique.total.count();
         perf->pktSndLossTotal    = m_stats.sndr.lost.total.count();
         perf->pktRcvLossTotal    = m_stats.rcvr.lost.total.count();
+        perf->pktRcvLossConfirmedTotal = m_stats.rcvr.lostConfirmed.total.count();
         perf->pktRetransTotal    = m_stats.sndr.sentRetrans.total.count();
         perf->pktSentACKTotal    = m_stats.rcvr.sentAck.total.count();
         perf->pktRecvACKTotal    = m_stats.sndr.recvdAck.total.count();
@@ -7871,6 +7938,12 @@ void srt::CUDT::bstats(CBytePerfMon *perf, bool clear, bool instantaneous)
         perf->mbpsMaxBW = m_config.llMaxBW > 0 ? Bps2Mbps(m_config.llMaxBW)
                         : m_CongCtl.ready()    ? Bps2Mbps(m_CongCtl->sndBandwidth())
                                                 : 0;
+
+        // Last completed sampling window, maintained by the timer thread. Read
+        // only - independent of @a clear and of the caller's polling cadence, so
+        // repeated reads inside one window all yield the same value.
+        perf->pctSndQuality = m_stats.pctSndQuality;
+        perf->pctRcvQuality = m_stats.pctRcvQuality;
 
         if (clear)
         {
@@ -10600,12 +10673,23 @@ void srt::CUDT::processClose()
     CGlobEvent::triggerEvent();
 }
 
+void srt::CUDT::countConfirmedLoss(int pkts)
+{
+    if (pkts <= 0)
+        return;
+
+    ScopedLock lg(m_StatsLock);
+    m_stats.rcvr.lostConfirmed.count(stats::Packets((uint32_t) pkts));
+}
+
 void srt::CUDT::sendLossReport(const std::vector<std::pair<int32_t, int32_t> > &loss_seqs)
 {
+    int confirmed = 0;
     vector<int32_t> seqbuffer;
     seqbuffer.reserve(2 * loss_seqs.size()); // pessimistic
     for (loss_seqs_t::const_iterator i = loss_seqs.begin(); i != loss_seqs.end(); ++i)
     {
+        confirmed += CSeqNo::seqoff(i->first, i->second) + 1;
         if (i->first == i->second)
         {
             seqbuffer.push_back(i->first);
@@ -10623,6 +10707,7 @@ void srt::CUDT::sendLossReport(const std::vector<std::pair<int32_t, int32_t> > &
     if (!seqbuffer.empty())
     {
         sendCtrl(UMSG_LOSSREPORT, NULL, &seqbuffer[0], (int) seqbuffer.size());
+        countConfirmedLoss(confirmed);
     }
 }
 
@@ -11074,7 +11159,9 @@ int srt::CUDT::processData(CUnit* in_unit)
     // If the peer doesn't understand REXMIT flag, send rexmit request
     // always immediately.
     int initial_loss_ttl = 0;
-    if (m_bPeerRexmitFlag)
+    if (m_config.bSRTLA && m_bPeerRexmitFlag)
+        initial_loss_ttl = SRTLA_WITNESS_TTL;
+    else if (!m_config.bSRTLA && m_bPeerRexmitFlag)
         initial_loss_ttl = m_iReorderTolerance;
 
     // Track packet loss in statistics early, because a packet filter (e.g. FEC) might recover it later on,
@@ -11208,6 +11295,8 @@ int srt::CUDT::processData(CUnit* in_unit)
                 {
                     // The LOSSREPORT will be sent after initial_loss_ttl.
                     m_FreshLoss.push_back(CRcvFreshLoss(i->first, i->second, initial_loss_ttl));
+                    HLOGC(qrlog.Debug, log << CONID() << "SRTLA LOSSTRACE detect %" << i->first << "-%" << i->second
+                            << " witness %" << packet.seqno());
                 }
             }
         }
@@ -11310,6 +11399,7 @@ int srt::CUDT::processData(CUnit* in_unit)
     // can be quite well optimized.
 
     vector<int32_t> lossdata;
+    int             confirmed_loss = 0;
     {
         ScopedLock lg(m_RcvLossLock);
 
@@ -11318,6 +11408,19 @@ int srt::CUDT::processData(CUnit* in_unit)
         if (initial_loss_ttl && !m_FreshLoss.empty())
         {
             deque<CRcvFreshLoss>::iterator i = m_FreshLoss.begin();
+
+            if (m_config.bSRTLA)
+            {
+                // SRTLA: reports are driven from checkNAKTimer(); records
+                // persist until recovered or dropped.
+                for (; i != m_FreshLoss.end(); ++i)
+                {
+                    if (i->ttl > 0)
+                        --i->ttl;
+                }
+            }
+            else
+            {
 
             // Phase 1: take while TTL <= 0.
             // There can be more than one record with the same TTL, if it has happened before
@@ -11328,6 +11431,7 @@ int srt::CUDT::processData(CUnit* in_unit)
                 HLOGC(qrlog.Debug, log << "Packet seq " << i->seq[0] << "-" << i->seq[1]
                         << " (" << (CSeqNo::seqoff(i->seq[0], i->seq[1]) + 1) << " packets) considered lost - sending LOSSREPORT");
                 addLossRecord(lossdata, i->seq[0], i->seq[1]);
+                confirmed_loss += CSeqNo::seqoff(i->seq[0], i->seq[1]) + 1;
             }
 
             // Remove elements that have been processed and prepared for lossreport.
@@ -11351,12 +11455,15 @@ int srt::CUDT::processData(CUnit* in_unit)
             // Phase 2: rest of the records should have TTL decreased.
             for (; i != m_FreshLoss.end(); ++i)
                 --i->ttl;
+
+            }
         }
     }
     if (!lossdata.empty())
     {
         sendCtrl(UMSG_LOSSREPORT, NULL, &lossdata[0], (int) lossdata.size());
     }
+    countConfirmedLoss(confirmed_loss);
 
     // was_sent_in_order means either of:
     // - packet was sent in order (first if branch above)
@@ -11365,7 +11472,7 @@ int srt::CUDT::processData(CUnit* in_unit)
     if (m_bPeerRexmitFlag && was_sent_in_order)
     {
         ++m_iConsecOrderedDelivery;
-        if (m_iConsecOrderedDelivery >= 50)
+        if (!m_config.bSRTLA && m_iConsecOrderedDelivery >= 50)
         {
             m_iConsecOrderedDelivery = 0;
             if (m_iReorderTolerance > 0)
@@ -11451,6 +11558,31 @@ void srt::CUDT::updateIdleLinkFrom(CUDT* source)
 /// do not include the lacking packet.
 /// The tolerance is not increased infinitely - it's bordered by iMaxReorderTolerance.
 /// This value can be set in options - SRT_LOSSMAXTTL.
+// Caller holds m_RcvLossLock.
+uint32_t srt::CUDT::srtlaReorderHoldUs(const steady_clock::time_point& now)
+{
+    uint32_t steady_us = m_uiSrtlaHoldSteadyUs.load();
+    if (steady_us == 0)
+        steady_us = SRTLA_HOLD_FALLBACK_US;
+
+    const uint32_t fast_us = srtlaDecayedFastHold(m_uiSrtlaHoldFastUs,
+            count_microseconds(now - m_tsSrtlaHoldFastSet));
+    if (fast_us == 0)
+        m_uiSrtlaHoldFastUs = 0;
+
+    uint32_t hold = std::max(steady_us, fast_us);
+    if (hold < SRTLA_HOLD_FLOOR_US)
+        hold = SRTLA_HOLD_FLOOR_US;
+
+    uint32_t cap = SRTLA_HOLD_CAP_US;
+    const uint32_t lat_half_us = (uint32_t)m_iTsbPdDelay_ms * 500;
+    if (lat_half_us > 0 && lat_half_us < cap)
+        cap = lat_half_us;
+    if (hold > cap)
+        hold = cap;
+    return hold;
+}
+
 void srt::CUDT::unlose(const CPacket &packet)
 {
     ScopedLock lg(m_RcvLossLock);
@@ -11506,13 +11638,36 @@ void srt::CUDT::unlose(const CPacket &packet)
     //   (in this case it's empty anyway)
     // - decrease current reorder tolerance based on whether packets come in order
     //   (current reorder tolerance is 0 anyway)
-    if (m_bPeerRexmitFlag == 0 || m_iReorderTolerance == 0)
+    if (m_bPeerRexmitFlag == 0 || (!m_config.bSRTLA && m_iReorderTolerance == 0))
         return;
 
     int had_ttl = 0;
-    if (CRcvFreshLoss::removeOne((m_FreshLoss), sequence, (&had_ttl)))
+    steady_clock::time_point detect_time;
+    if (CRcvFreshLoss::removeOne((m_FreshLoss), sequence, (&had_ttl), (&detect_time)))
     {
         HLOGC(qrlog.Debug, log << "sequence " << sequence << " removed from belated lossreport record");
+        HLOGC(qrlog.Debug, log << CONID() << "SRTLA LOSSTRACE recovered %" << sequence << " after "
+                << (is_zero(detect_time) ? -1 : count_microseconds(steady_clock::now() - detect_time) / 1000) << " ms "
+                << (packet.getRexmitFlag() ? "retransmission" : "original"));
+
+        if (m_config.bSRTLA && was_reordered && !is_zero(detect_time))
+        {
+            const int64_t late_us = count_microseconds(steady_clock::now() - detect_time);
+            if (late_us > 0)
+            {
+                const uint32_t want_us = (uint32_t)std::min<int64_t>(late_us + SRTLA_HOLD_EVIDENCE_MARGIN_US, SRTLA_HOLD_CAP_US);
+                const uint32_t cur_fast_us = srtlaDecayedFastHold(m_uiSrtlaHoldFastUs,
+                        count_microseconds(steady_clock::now() - m_tsSrtlaHoldFastSet));
+                if (want_us > cur_fast_us)
+                {
+                    HLOGC(qrlog.Debug, log << CONID() << "SRTLA: belated original %" << sequence
+                            << " late by " << (late_us / 1000) << "ms - raising reorder hold to "
+                            << (want_us / 1000) << "ms");
+                    m_uiSrtlaHoldFastUs = want_us;
+                    m_tsSrtlaHoldFastSet = steady_clock::now();
+                }
+            }
+        }
     }
 
     if (was_reordered)
@@ -11528,7 +11683,7 @@ void srt::CUDT::unlose(const CPacket &packet)
             HLOGC(qrlog.Debug, log << "... arrived at TTL " << had_ttl << " case " << m_iConsecEarlyDelivery);
 
             // After 10 consecutive
-            if (m_iConsecEarlyDelivery >= 10)
+            if (!m_config.bSRTLA && m_iConsecEarlyDelivery >= 10)
             {
                 m_iConsecEarlyDelivery = 0;
                 if (m_iReorderTolerance > 0)
@@ -11591,7 +11746,9 @@ void srt::CUDT::dropFromLossLists(int32_t from, int32_t to)
             << range.str() << " packets)");
 #endif
 
-    if (m_bPeerRexmitFlag == 0 || m_iReorderTolerance == 0)
+    // SRTLA fills m_FreshLoss from a time-based hold, independently of the reorder
+    // tolerance. Same condition as in unlose().
+    if (m_bPeerRexmitFlag == 0 || (!m_config.bSRTLA && m_iReorderTolerance == 0))
         return;
 
     // All code below concerns only "belated lossreport" feature.
@@ -12091,7 +12248,10 @@ int srt::CUDT::checkNAKTimer(const steady_clock::time_point& currtime)
     // by the filter. By this reason they appear often out of order
     // and for adding them properly the loss list container wasn't
     // prepared. This then requires some more effort to implement.
-    if (!m_config.bRcvNakReport || m_PktFilterRexmitLevel != SRT_ARQ_ALWAYS)
+    // Under SRTLA this is the only loss-report emitter, so SRTO_NAKREPORT must not
+    // disable it - the hold is the pacing. The packet-filter condition still applies.
+    const bool srtla_emitter = m_config.bSRTLA && m_bPeerRexmitFlag;
+    if ((!m_config.bRcvNakReport && !srtla_emitter) || m_PktFilterRexmitLevel != SRT_ARQ_ALWAYS)
         return BECAUSE_NO_REASON;
 
     /*
@@ -12112,11 +12272,84 @@ int srt::CUDT::checkNAKTimer(const steady_clock::time_point& currtime)
         if (currtime <= m_tsNextNAKTime.load())
             return BECAUSE_NO_REASON; // wait for next NAK time
 
-        sendCtrl(UMSG_LOSSREPORT);
-        debug_decision = BECAUSE_NAKREPORT;
+        if (srtla_emitter)
+        {
+            // SRTLA: time-gated loss reporting (single emitter for first
+            // reports and repeats).
+            if (count_microseconds(currtime - m_tsSrtlaHoldPollTime) >= 1000000)
+            {
+                m_tsSrtlaHoldPollTime = currtime;
+                if (m_pRcvQueue && m_pRcvQueue->m_pSrtlaRec)
+                    m_uiSrtlaHoldSteadyUs.store(m_pRcvQueue->m_pSrtlaRec->holdSteadyUs(m_SocketID));
+            }
+
+            vector<int32_t> lossdata;
+            int             confirmed_loss = 0;
+            int64_t         dbg_hold_us = 0, dbg_spacing_us = 0; size_t dbg_records = 0; // for the debug log below
+            {
+                ScopedLock lk(m_RcvLossLock);
+
+                const int64_t srtt_us = m_iSRTT.load();
+
+                SrtlaNakParams np;
+                np.hold_us    = srtlaReorderHoldUs(currtime);
+                // A round trip plus the measured link spread: SRTT tracks the fastest path, the
+                // retransmission may travel the slowest. The floored, evidence-raised hold is
+                // deliberately not used here (it doubled the wait under load).
+                np.spacing_us = std::max<int64_t>(srtt_us + std::max<int64_t>(m_uiSrtlaHoldSteadyUs.load(), 20000),
+                        count_microseconds(m_tdNAKInterval));
+                // No TSBPD means no play deadline and no TLPKTDROP: deadline handling off.
+                np.budget_us  = m_bTsbPd ? (int64_t)m_iTsbPdDelay_ms * 1000 : 0;
+                np.rtt_us     = srtt_us;
+                np.margin_us  = SRTLA_DEADLINE_MARGIN_US;
+                np.cap        = (size_t)m_iMaxDataPayloadSize / sizeof(int32_t);
+
+                const SrtlaNakPlan plan = srtlaPlanNak(m_FreshLoss, currtime, np);
+
+                lossdata.reserve(2 * plan.report.size());
+                for (size_t k = 0; k < plan.report.size(); ++k)
+                {
+                    CRcvFreshLoss& rec = m_FreshLoss[plan.report[k]];
+                    addLossRecord(lossdata, rec.seq[0], rec.seq[1]);
+                    HLOGC(qrlog.Debug, log << CONID() << "SRTLA LOSSTRACE request " << (is_zero(rec.report_time) ? "first" : "repeat")
+                            << " %" << rec.seq[0] << "-%" << rec.seq[1] << " age " << (count_microseconds(currtime - rec.timestamp) / 1000)
+                            << " ms remaining " << ((np.budget_us - count_microseconds(currtime - rec.timestamp) - np.rtt_us - np.margin_us) / 1000)
+                            << " ms hold " << (np.hold_us / 1000) << " ms spacing " << (np.spacing_us / 1000) << " ms");
+                    rec.report_time = currtime;
+                }
+                confirmed_loss = plan.confirmed;
+                dbg_hold_us = np.hold_us; dbg_spacing_us = np.spacing_us; dbg_records = plan.report.size();
+
+                // The indices above address the untouched container, so retire only now.
+                if (plan.retire > 0)
+                {
+                    HLOGC(qrlog.Debug,
+                          log << CONID() << "SRTLA: retiring " << plan.retire << " loss record(s) past the "
+                              << m_iTsbPdDelay_ms << "ms play budget (" << m_FreshLoss.size() << " held)");
+                    m_FreshLoss.erase(m_FreshLoss.begin(), m_FreshLoss.begin() + plan.retire);
+                }
+            }
+            if (!lossdata.empty())
+            {
+                sendCtrl(UMSG_LOSSREPORT, NULL, &lossdata[0], (int)lossdata.size());
+                countConfirmedLoss(confirmed_loss);
+                debug_decision = BECAUSE_NAKREPORT;
+                HLOGC(qrlog.Debug, log << CONID() << "SRTLA: loss report with " << dbg_records << " record(s), hold "
+                        << (dbg_hold_us / 1000) << " ms, spacing " << (dbg_spacing_us / 1000) << " ms, timer period "
+                        << count_milliseconds(m_tdNAKInterval) << " ms");
+            }
+        }
+        else
+        {
+            sendCtrl(UMSG_LOSSREPORT);
+            debug_decision = BECAUSE_NAKREPORT;
+        }
     }
 
-    m_tsNextNAKTime.store(currtime + m_tdNAKInterval);
+    steady_clock::duration next = m_tdNAKInterval;
+    if (srtla_emitter && next > microseconds_from(SRTLA_NAK_PERIOD_US))
+        next = microseconds_from(SRTLA_NAK_PERIOD_US);
+    m_tsNextNAKTime.store(currtime + next);
     return debug_decision;
 }
 
@@ -12294,12 +12527,39 @@ void srt::CUDT::checkRexmitTimer(const steady_clock::time_point& currtime)
     m_pSndQueue->m_pSndUList->update(this, CSndUList::DONT_RESCHEDULE);
 }
 
+void srt::CUDT::updateQualityWindow(const steady_clock::time_point& currtime)
+{
+    ScopedLock stat_lock(m_StatsLock);
+
+    if (count_microseconds(currtime - m_stats.tsQualityWindow) < QUALITY_WINDOW_US)
+        return;
+
+    const int64_t snd_clean    = m_stats.sndr.sentUnique.total.count();
+    const int64_t snd_impaired = m_stats.sndr.sentRetrans.total.count()
+                               + m_stats.sndr.dropped.total.count();
+    const int64_t rcv_clean    = m_stats.rcvr.recvdUnique.total.count();
+    const int64_t rcv_impaired = m_stats.rcvr.lostConfirmed.total.count();
+
+    m_stats.pctSndQuality = StatsQualityPct(snd_clean - m_stats.qualBaseSndClean,
+                                            snd_impaired - m_stats.qualBaseSndImpaired);
+    m_stats.pctRcvQuality = StatsQualityPct(rcv_clean - m_stats.qualBaseRcvClean,
+                                            rcv_impaired - m_stats.qualBaseRcvImpaired);
+
+    m_stats.qualBaseSndClean    = snd_clean;
+    m_stats.qualBaseSndImpaired = snd_impaired;
+    m_stats.qualBaseRcvClean    = rcv_clean;
+    m_stats.qualBaseRcvImpaired = rcv_impaired;
+    m_stats.tsQualityWindow     = currtime;
+}
+
 void srt::CUDT::checkTimers()
 {
     // update CC parameters
     updateCC(TEV_CHECKTIMER, EventVariant(TEV_CHT_INIT));
 
     const steady_clock::time_point currtime = steady_clock::now();
+
+    updateQualityWindow(currtime);
 
     // This is a very heavy log, unblock only for temporary debugging!
 #if 0

@@ -240,8 +240,19 @@ typedef enum SRT_SOCKOPT {
    SRTO_MAXREXMITBW = 63,    // Maximum bandwidth limit for retransmision (Bytes/s)
 #endif
 
+   SRTO_SRTLA = 120, // On a listener: designate an SRTLA (link-aggregation) demux listener.
+                     // Inherited by accepted connections, where it also enables the SRTLA
+                     // multipath delivery tuning (retransmit-flag / ordered-delivery heuristics)
+                     // and enforces the SRTLA minimum receiver latency of 1000 ms: a lower
+                     // SRTO_RCVLATENCY / SRTO_LATENCY is raised on accept and the raised value
+                     // is negotiated to the sender. (Formerly SRTO_SRTLAPATCHES.)
+
    SRTO_E_SIZE // Always last element, not a valid option.
 } SRT_SOCKOPT;
+
+#ifndef SRTO_SRTLAPATCHES
+#define SRTO_SRTLAPATCHES SRTO_SRTLA
+#endif
 
 
 #ifdef __cplusplus
@@ -407,6 +418,21 @@ struct CBytePerfMon
    int64_t  pktRecvUnique;              // number of packets to be received by the application
    uint64_t byteSentUnique;             // number of data bytes, sent by the application
    uint64_t byteRecvUnique;             // number of data bytes to be received by the application
+
+   // Packets that were still missing once the reorder grace period was over and were
+   // therefore requested back. Unlike pktRcvLoss (a sequence discontinuity metric per
+   // RFC 4737, which counts reordering as loss and never takes it back), this counts
+   // only losses the receiver itself concluded were real. NAK repeats are not counted.
+   int      pktRcvLossConfirmedTotal;   // total number of packets confirmed as lost (receiver side)
+   int      pktRcvLossConfirmed;        // number of packets confirmed as lost (receiver side)
+
+   // Share of the traffic that was not impaired, in percent (100 = clean, 0 = nothing
+   // got through), over the last completed one-second sampling window. The window is
+   // rolled internally on its own cadence, so these are independent of @a clear and of
+   // how often the caller polls: every read inside the same window returns the same
+   // value. Both are 100 for an idle window.
+   double   pctSndQuality;              // 100 * pktSentUnique / (pktSentUnique + pktRetrans + pktSndDrop)
+   double   pctRcvQuality;              // 100 * pktRecvUnique / (pktRecvUnique + pktRcvLossConfirmed)
 };
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -994,6 +1020,40 @@ SRT_API int srt_config_add(SRT_SOCKOPT_CONFIG* config, SRT_SOCKOPT option, const
 
 SRT_API SRT_SOCKGROUPCONFIG srt_prepare_endpoint(const struct sockaddr* src /*nullable*/, const struct sockaddr* adr, int namelen);
 SRT_API       int srt_connect_group(SRTSOCKET group, SRT_SOCKGROUPCONFIG name[], int arraysize);
+
+// SRTLA per-connection statistics
+#define SRT_SRTLA_MAX_PEERS 16
+
+// Live per-link values, maintained as per-packet EWMAs and read fresh (like SRT's msRTT).
+typedef struct SRT_SRTLA_PEER_STATS_ {
+    uint32_t connectionId;      // Anonymous FNV-1a hash of IP:port
+    uint32_t kbpsRecvRate;      // total receive rate, kbps (incl. retransmissions & control)
+    uint32_t kbpsRecvUnique;    // first-seen (non-duplicate) receive rate, kbps
+    int32_t  transitUs;         // smoothed relative one-way transit (consumer anchors RTT to msRTT)
+    uint32_t usJitter;          // smoothed jitter, microseconds (RFC 3550)
+    uint64_t establishedMs;     // link start, demux monotonic milliseconds
+
+    // Legacy OpenIRL source compatibility for srt-live-server 1.5.2.
+    uint32_t bitrate;
+    uint32_t jitter;
+    uint64_t bytesReceived;
+    uint32_t uptime;
+    uint32_t throughput;
+} SRT_SRTLA_PEER_STATS;
+
+typedef struct SRT_SRTLA_STATS_ {
+    int      valid;             // 1 if a bound SRTLA group was found for the socket, else 0
+    uint8_t  version;           // 2
+    uint8_t  numPeers;
+    uint64_t nowMs;             // demux monotonic "now" (derive uptime = nowMs - establishedMs)
+    SRT_SRTLA_PEER_STATS peers[SRT_SRTLA_MAX_PEERS];
+
+    // Legacy OpenIRL source compatibility for srt-live-server 1.5.2.
+    uint32_t totalBitrate;
+    uint64_t timestamp;
+} SRT_SRTLA_STATS;
+
+SRT_API int srt_srtla_stats(SRTSOCKET u, SRT_SRTLA_STATS* stats);
 
 #ifdef __cplusplus
 }

@@ -254,6 +254,7 @@ The following table lists SRT API socket options in alphabetical order. Option d
 | [`SRTO_SNDKMSTATE`](#SRTO_SNDKMSTATE)                   | 1.2.0 |          | `int32_t` | enum    |                   |          | R   | S     |
 | [`SRTO_SNDSYN`](#SRTO_SNDSYN)                           |       | post     | `bool`    |         | true              |          | RW  | GSI   |
 | [`SRTO_SNDTIMEO`](#SRTO_SNDTIMEO)                       |       | post     | `int32_t` | ms      | -1                | -1..     | RW  | GSI   |
+| [`SRTO_SRTLA`](#SRTO_SRTLA)                             | fork  | pre-bind | `bool`    |         | false             |          | RW  | S     |
 | [`SRTO_STATE`](#SRTO_STATE)                             |       |          | `int32_t` | enum    |                   |          | R   | S     |
 | [`SRTO_STREAMID`](#SRTO_STREAMID)                       | 1.3.0 | pre      | `string`  |         | ""                | [512]    | RW  | GSD   |
 | [`SRTO_TLPKTDROP`](#SRTO_TLPKTDROP)                     | 1.0.6 | pre      | `bool`    |         | \*                |          | RW  | GSD   |
@@ -1347,6 +1348,9 @@ This value is only significant when [`SRTO_TSBPDMODE`](#SRTO_TSBPDMODE) is enabl
 
 **Default value**: 120 ms in Live mode, 0 in File mode (see [`SRTO_TRANSTYPE`](#SRTO_TRANSTYPE)).
 
+On connections accepted by an SRTLA listener ([`SRTO_SRTLA`](#SRTO_SRTLA)) the value is never below
+1000 ms; a lower setting is raised on accept.
+
 The latency value defines the **minimum** receiver buffering delay before delivering an SRT data packet
 from a receiving SRT socket to a receiving application.
 
@@ -1627,6 +1631,33 @@ if in "non-blocking mode". The -1 value means no time limit.
 [Return to list](#list-of-options)
 
 ---
+
+#### SRTO_SRTLA
+
+| OptName      | Since | Restrict | Type   | Units | Default | Range | Dir | Entity |
+| ------------ | ----- | -------- | ------ | ----- | ------- | ----- | --- | ------ |
+| `SRTO_SRTLA` | fork  | pre-bind | `bool` |       | false   |       | RW  | S      |
+
+Set on a listener before binding, this designates the socket's UDP port as an SRTLA (SRT Link
+Aggregation) demux: bonded links register on it with the SRTLA protocol, their packets are merged
+into one SRT connection, and the receiver's SRT control packets are fanned back out over the links.
+A muxer designated this way never merges with a plain SRT muxer.
+
+Accepted connections inherit the flag. On them it enables the SRTLA multipath delivery tuning
+(time-based loss reporting, reorder hold, loss-report fan-out) and enforces the **SRTLA minimum
+receiver latency of 1000 ms**:
+
+- A lower [`SRTO_RCVLATENCY`](#SRTO_RCVLATENCY) / [`SRTO_LATENCY`](#SRTO_LATENCY) on the listener is
+  raised to 1000 ms when the connection is accepted (logged at `note` level), and the raised value is
+  negotiated to the sender as its peer latency. The sender then buffers for the raised value as well.
+- The raise is one-directional: a latency of 1000 ms or more is left as configured.
+- Rationale: the reorder hold over bonded links may grow up to half the latency (capped at
+  500 ms) and one full recovery round trip has to fit behind it; below 1000 ms a lost
+  retransmission can no longer be recovered before the play deadline.
+
+Encoders for bonded streaming default to 2000 ms (BELABOX) or 3000 ms; the practical
+recommendation for cellular bonding is 2000 ms or more. Latencies up to 5000 ms are exercised by
+the end-to-end harness in `testing/srtla-e2e`.
 
 #### SRTO_STATE
 

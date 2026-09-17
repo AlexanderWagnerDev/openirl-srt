@@ -68,6 +68,7 @@ modified by
 #include "threadname.h"
 #include "srt.h"
 #include "udt.h"
+#include "srtla_rec.h"
 
 #ifdef _WIN32
 #include <win/wintime.h>
@@ -3477,6 +3478,17 @@ void srt::CUDTUnited::updateMux(CUDTSocket* s, const sockaddr_any& reqaddr, cons
         // of packet.
         m.m_pRcvQueue->init(128, s->core().controlPayloadSize(reqaddr.family()), m.m_iIPversion, 1024, m.m_pChannel, m.m_pTimer);
 
+        // If this muxer is designated as an SRTLA demux listener (SRTO_SRTLA), create
+        // the demux and share it with both queues (ingress classification on the
+        // receive side, ACK/NAK fan-out on the send side). A plain SRT muxer leaves
+        // both pointers NULL and is completely unaffected.
+        if (m.m_mcfg.bSRTLA)
+        {
+            m.m_pSrtlaRec              = new SrtlaRec(m.m_pChannel);
+            m.m_pRcvQueue->m_pSrtlaRec = m.m_pSrtlaRec;
+            m.m_pSndQueue->m_pSrtlaRec = m.m_pSrtlaRec;
+        }
+
         // Rewrite the port here, as it might be only known upon return
         // from CChannel::open.
         m.m_iPort               = installMuxer((s), m);
@@ -4529,6 +4541,32 @@ int srt::CUDT::bstats(SRTSOCKET u, CBytePerfMon* perf, bool clear, bool instanta
     catch (const std::exception& ee)
     {
         LOGC(aclog.Fatal, log << "bstats: UNEXPECTED EXCEPTION: " << typeid(ee).name() << ": " << ee.what());
+        return APIError(MJ_UNKNOWN, MN_NONE, 0);
+    }
+}
+
+int srt::CUDT::srtla_stats(SRTSOCKET u, SRT_SRTLA_STATS* stats)
+{
+    if (!stats)
+        return APIError(MJ_NOTSUP, MN_INVAL, 0);
+
+    try
+    {
+        CUDT& udt = uglobal().locateSocket(u, CUDTUnited::ERH_THROW)->core();
+        // Computed on demand from the SRTLA demux (like srt_bstats): resolution equals
+        // the polling frequency. Fills valid=0 for a non-SRTLA socket.
+        memset(stats, 0, sizeof *stats);
+        if (udt.m_pRcvQueue && udt.m_pRcvQueue->m_pSrtlaRec)
+            udt.m_pRcvQueue->m_pSrtlaRec->fillStats(u, stats);
+        return 0;
+    }
+    catch (const CUDTException& e)
+    {
+        return APIError(e);
+    }
+    catch (const std::exception& ee)
+    {
+        LOGC(aclog.Fatal, log << "srtla_stats: UNEXPECTED EXCEPTION: " << typeid(ee).name() << ": " << ee.what());
         return APIError(MJ_UNKNOWN, MN_NONE, 0);
     }
 }
