@@ -75,7 +75,26 @@ jobs:
               // Initialize mutex and condition variables."""
           if old not in text:
               raise SystemExit("core.cpp conflict block changed unexpectedly")
-          core.write_text(text.replace(old, new, 1))
+          text = text.replace(old, new, 1)
+
+          # Haivision 1.5.7 replaced the raw receiver-loss array API with
+          # FixedArray and renamed the payload-size member. Keep OpenIRL's
+          # SRTLA fresh-loss filtering logic, but use the current upstream API.
+          old_api = """                const int cap = m_iMaxSRTPayloadSize / 4;
+                          int32_t* arr = new int32_t[cap];
+                          int arrlen = 0;
+                          m_pRcvLossList->getLossArray(arr, arrlen, cap);"""
+          new_api = """                FixedArray<int32_t> arr(m_iMaxDataPayloadSize / sizeof(int32_t));
+                          const int arrlen = m_pRcvLossList->getLossArray(arr);"""
+          if old_api not in text:
+              raise SystemExit("legacy getLossArray block changed unexpectedly")
+          text = text.replace(old_api, new_api, 1)
+
+          old_delete = "                delete[] arr;\n"
+          if text.count(old_delete) != 1:
+              raise SystemExit("legacy loss-array delete block changed unexpectedly")
+          text = text.replace(old_delete, "", 1)
+          core.write_text(text)
 
           hdr = Path("srtcore/core.h")
           text = hdr.read_text()
@@ -112,6 +131,7 @@ jobs:
           grep -q 'srt_srtla_stats' srtcore/srt.h
           grep -q 'UMSG_SRTLA_STATS' srtcore/common.h
           grep -q 'processSrtlaStats' srtcore/core.cpp
+          grep -q 'FixedArray<int32_t> arr(m_iMaxDataPayloadSize / sizeof(int32_t))' srtcore/core.cpp
 
       - name: Build patched libsrt
         shell: bash
