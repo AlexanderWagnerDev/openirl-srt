@@ -212,6 +212,8 @@ struct SrtOptionAction
         flags[SRTO_CRYPTOMODE]         = SRTO_R_PRE;
 #endif
 
+        flags[SRTO_SRTLAPATCHES]       = SRTO_R_PRE;
+
         // For "private" options (not derived from the listener
         // socket by an accepted socket) provide below private_default
         // to which these options will be reset after blindly
@@ -437,6 +439,8 @@ void srt::CUDT::construct()
     m_zSndAveragePacketSize = 0;
     m_zSndMaxPacketSize = 0;
 #endif
+
+    memset(&m_SrtlaStats, 0, sizeof(m_SrtlaStats));
 
     // Initialize mutex and condition variables.
     initSynch();
@@ -989,6 +993,11 @@ void srt::CUDT::getOpt(SRT_SOCKOPT optName, void *optval, int &optlen)
         optlen = sizeof(int32_t);
         break;
 #endif
+
+    case SRTO_SRTLAPATCHES:
+        optlen          = sizeof(bool);
+        *(bool *)optval = m_config.srtlaPatches;
+        break;
 
     default:
         throw CUDTException(MJ_NOTSUP, MN_NONE, 0);
@@ -9614,10 +9623,82 @@ bool srt::CUDT::processCtrl(const CPacket &ctrlpkt)
         result = processCtrlUserDefined(ctrlpkt);
         break;
 
+    case UMSG_SRTLA_STATS:
+        if (m_config.srtlaPatches)
+            processSrtlaStats(ctrlpkt);
+        break;
+
     default:
         break;
     }
     return result;
+}
+
+void srt::CUDT::processSrtlaStats(const CPacket& ctrlpkt)
+{
+    // Payload has already been converted to host byte order by toHostByteOrder()/NtoHLA.
+    // Stats-Header: 4 words (16 bytes)
+    //   Word 0: [version:8][num_peers:8][reserved:16]
+    //   Word 1: group_total_bitrate (kbps, payload only)
+    //   Word 2: timestamp_high
+    //   Word 3: timestamp_low
+    // Per-Peer: 7 words (conn_id, bitrate, jitter, bytes_hi, bytes_lo, uptime, throughput)
+
+    const uint32_t* payload = reinterpret_cast<const uint32_t*>(ctrlpkt.data());
+    const size_t payload_len = ctrlpkt.size();
+
+    // Minimum: stats header = 4 words = 16 bytes
+    if (payload_len < 16)
+    {
+        HLOGC(inlog.Debug, log << CONID() << "SRTLA stats: packet too short (" << payload_len << " bytes)");
+        return;
+    }
+
+    const uint32_t word0 = payload[0];
+    const uint8_t version = (word0 >> 24) & 0xFF;
+    const uint8_t num_peers = (word0 >> 16) & 0xFF;
+
+    if (version != 1)
+    {
+        HLOGC(inlog.Debug, log << CONID() << "SRTLA stats: unknown version " << int(version));
+        return;
+    }
+
+    if (num_peers > SRT_SRTLA_MAX_PEERS)
+    {
+        HLOGC(inlog.Debug, log << CONID() << "SRTLA stats: too many peers (" << int(num_peers) << ")");
+        return;
+    }
+
+    // Check payload size: header (16) + num_peers * 7 words * 4 bytes
+    const size_t expected = 16 + static_cast<size_t>(num_peers) * 28;
+    if (payload_len < expected)
+    {
+        HLOGC(inlog.Debug, log << CONID() << "SRTLA stats: payload too short for " << int(num_peers) << " peers");
+        return;
+    }
+
+    SRT_SRTLA_STATS stats;
+    memset(&stats, 0, sizeof(stats));
+    stats.valid = 1;
+    stats.version = version;
+    stats.numPeers = num_peers;
+    stats.totalBitrate = payload[1];
+    stats.timestamp = (static_cast<uint64_t>(payload[2]) << 32) | payload[3];
+
+    for (uint8_t i = 0; i < num_peers; i++)
+    {
+        const uint32_t* peer = payload + 4 + i * 7;
+        stats.peers[i].connectionId   = peer[0];
+        stats.peers[i].bitrate  = peer[1];
+        stats.peers[i].jitter   = peer[2];
+        stats.peers[i].bytesReceived  = (static_cast<uint64_t>(peer[3]) << 32) | peer[4];
+        stats.peers[i].uptime   = peer[5];
+        stats.peers[i].throughput = peer[6];
+    }
+
+    ScopedLock lock(m_SrtlaStatsLock);
+    m_SrtlaStats = stats;
 }
 
 void srt::CUDT::updateSrtRcvSettings()
@@ -11074,7 +11155,9 @@ int srt::CUDT::processData(CUnit* in_unit)
     // If the peer doesn't understand REXMIT flag, send rexmit request
     // always immediately.
     int initial_loss_ttl = 0;
-    if (m_bPeerRexmitFlag)
+    if (m_config.srtlaPatches && m_bPeerRexmitFlag)
+        initial_loss_ttl = m_config.iMaxReorderTolerance;
+    else if (!m_config.srtlaPatches && m_bPeerRexmitFlag)
         initial_loss_ttl = m_iReorderTolerance;
 
     // Track packet loss in statistics early, because a packet filter (e.g. FEC) might recover it later on,
@@ -11365,7 +11448,7 @@ int srt::CUDT::processData(CUnit* in_unit)
     if (m_bPeerRexmitFlag && was_sent_in_order)
     {
         ++m_iConsecOrderedDelivery;
-        if (m_iConsecOrderedDelivery >= 50)
+        if (!m_config.srtlaPatches && m_iConsecOrderedDelivery >= 50)
         {
             m_iConsecOrderedDelivery = 0;
             if (m_iReorderTolerance > 0)
@@ -11528,7 +11611,7 @@ void srt::CUDT::unlose(const CPacket &packet)
             HLOGC(qrlog.Debug, log << "... arrived at TTL " << had_ttl << " case " << m_iConsecEarlyDelivery);
 
             // After 10 consecutive
-            if (m_iConsecEarlyDelivery >= 10)
+            if (!m_config.srtlaPatches && m_iConsecEarlyDelivery >= 10)
             {
                 m_iConsecEarlyDelivery = 0;
                 if (m_iReorderTolerance > 0)
@@ -12112,8 +12195,69 @@ int srt::CUDT::checkNAKTimer(const steady_clock::time_point& currtime)
         if (currtime <= m_tsNextNAKTime.load())
             return BECAUSE_NO_REASON; // wait for next NAK time
 
-        sendCtrl(UMSG_LOSSREPORT);
-        debug_decision = BECAUSE_NAKREPORT;
+        if (m_config.srtlaPatches)
+        {
+            vector<int32_t> lossdata;
+            {
+                ScopedLock lk(m_RcvLossLock);
+                FixedArray<int32_t> arr(m_iMaxDataPayloadSize / sizeof(int32_t));
+                const int arrlen = m_pRcvLossList->getLossArray(arr);
+                const steady_clock::duration max_age = milliseconds_from(250);
+                for (int n = 0; n < arrlen; )
+                {
+                    int32_t lo, hi;
+                    if (arr[n] & LOSSDATA_SEQNO_RANGE_FIRST)
+                    {
+                        lo = arr[n] & ~LOSSDATA_SEQNO_RANGE_FIRST;
+                        hi = arr[n + 1];
+                        n += 2;
+                    }
+                    else
+                    {
+                        lo = hi = arr[n];
+                        n += 1;
+                    }
+                    int32_t runStart = SRT_SEQNO_NONE;
+                    for (int32_t s = lo; ; s = CSeqNo::incseq(s))
+                    {
+                        bool fresh = false;
+                        for (size_t k = 0; k < m_FreshLoss.size(); ++k)
+                        {
+                            if (CSeqNo::seqcmp(s, m_FreshLoss[k].seq[0]) >= 0 && CSeqNo::seqcmp(s, m_FreshLoss[k].seq[1]) <= 0)
+                            {
+                                if (currtime - m_FreshLoss[k].timestamp < max_age)
+                                    fresh = true;
+                                break;
+                            }
+                        }
+                        if (!fresh)
+                        {
+                            if (runStart == SRT_SEQNO_NONE)
+                                runStart = s;
+                        }
+                        else if (runStart != SRT_SEQNO_NONE)
+                        {
+                            addLossRecord(lossdata, runStart, CSeqNo::decseq(s));
+                            runStart = SRT_SEQNO_NONE;
+                        }
+                        if (s == hi)
+                            break;
+                    }
+                    if (runStart != SRT_SEQNO_NONE)
+                        addLossRecord(lossdata, runStart, hi);
+                }
+            }
+            if (!lossdata.empty())
+            {
+                sendCtrl(UMSG_LOSSREPORT, NULL, &lossdata[0], (int)lossdata.size());
+                debug_decision = BECAUSE_NAKREPORT;
+            }
+        }
+        else
+        {
+            sendCtrl(UMSG_LOSSREPORT);
+            debug_decision = BECAUSE_NAKREPORT;
+        }
     }
 
     m_tsNextNAKTime.store(currtime + m_tdNAKInterval);

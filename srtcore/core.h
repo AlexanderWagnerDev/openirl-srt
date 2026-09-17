@@ -372,6 +372,7 @@ public: //API
     static int epoll_release(const int eid);
     static CUDTException& getlasterror();
     static int bstats(SRTSOCKET u, CBytePerfMon* perf, bool clear = true, bool instantaneous = false);
+    static int srtla_stats(SRTSOCKET u, SRT_SRTLA_STATS* stats);
 #if ENABLE_BONDING
     static int groupsockbstats(SRTSOCKET u, CBytePerfMon* perf, bool clear = true);
 #endif
@@ -1206,6 +1207,8 @@ private: // synchronization: mutexes and conditions
     sync::Mutex m_SendLock;                      // used to synchronize "send" call
     sync::Mutex m_RcvLossLock;                   // Protects the receiver loss list (access: CRcvQueue::worker, CUDT::tsbpd)
     mutable sync::Mutex m_StatsLock;             // used to synchronize access to trace statistics
+    SRT_SRTLA_STATS m_SrtlaStats;
+    mutable sync::Mutex m_SrtlaStatsLock;
 
     void initSynch();
     void destroySynch();
@@ -1242,6 +1245,7 @@ private: // Generation and processing of packets
     void sendLossReport(const std::vector< std::pair<int32_t, int32_t> >& losslist);
 
     bool processCtrl(const CPacket& ctrlpkt);
+    void processSrtlaStats(const CPacket& ctrlpkt);
 
     /// @brief Process incoming control ACK packet.
     /// @param ctrlpkt incoming ACK packet
