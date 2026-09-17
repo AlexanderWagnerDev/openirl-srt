@@ -303,6 +303,7 @@ class CUDT
     friend class CRcvQueue;
     friend class CSndUList;
     friend class CRcvUList;
+    friend class SrtlaRec;
     friend class PacketFilter;
     friend class CUDTGroup;
     friend class TestMockCUDT; // unit tests
@@ -372,6 +373,7 @@ public: //API
     static int epoll_release(const int eid);
     static CUDTException& getlasterror();
     static int bstats(SRTSOCKET u, CBytePerfMon* perf, bool clear = true, bool instantaneous = false);
+    static int srtla_stats(SRTSOCKET u, SRT_SRTLA_STATS* stats);
 #if ENABLE_BONDING
     static int groupsockbstats(SRTSOCKET u, CBytePerfMon* perf, bool clear = true);
 #endif
@@ -1134,6 +1136,16 @@ private: // Receiving related data
     SRT_ATTR_GUARDED_BY(m_RcvLossLock)
     std::deque<CRcvFreshLoss> m_FreshLoss;       //< Lost sequence already added to m_pRcvLossList, but not yet sent UMSG_LOSSREPORT for.
 
+    // SRTLA loss-report timing state (bSRTLA only).
+    sync::atomic<uint32_t> m_uiSrtlaHoldSteadyUs;
+    SRT_ATTR_GUARDED_BY(m_RcvLossLock)
+    uint32_t m_uiSrtlaHoldFastUs;
+    SRT_ATTR_GUARDED_BY(m_RcvLossLock)
+    sync::steady_clock::time_point m_tsSrtlaHoldFastSet;
+    sync::steady_clock::time_point m_tsSrtlaHoldPollTime;
+
+    uint32_t srtlaReorderHoldUs(const sync::steady_clock::time_point& now);
+
     int m_iReorderTolerance;                     //< Current value of dynamic reorder tolerance
     int m_iConsecEarlyDelivery;                  //< Increases with every OOO packet that came <TTL-2 time, resets with every increased reorder tolerance
     int m_iConsecOrderedDelivery;                //< Increases with every packet coming in order or retransmitted, resets with every out-of-order packet
@@ -1241,8 +1253,23 @@ private: // Generation and processing of packets
     int  sendCtrlAck(CPacket& ctrlpkt, int size);
     void sendLossReport(const std::vector< std::pair<int32_t, int32_t> >& losslist);
 
+<<<<<<< ours
     bool processCtrl(const CPacket& ctrlpkt);
 
+||||||| base
+    void processCtrl(const CPacket& ctrlpkt);
+    
+=======
+    /// Record packets that are being requested back for the first time, that is,
+    /// that were still missing once the reorder grace period was over. Feeds
+    /// pctRcvQuality. NAK repeats must not be passed here.
+    /// Takes m_StatsLock, so the caller must not hold it.
+    /// @param pkts  number of sequence numbers confirmed as lost
+    void countConfirmedLoss(int pkts);
+
+    void processCtrl(const CPacket& ctrlpkt);
+
+>>>>>>> theirs
     /// @brief Process incoming control ACK packet.
     /// @param ctrlpkt incoming ACK packet
     /// @param currtime current clock time
@@ -1367,7 +1394,23 @@ private: // Trace
         int64_t sndDuration;                // real time for sending
         time_point sndDurationCounter;      // timers to record the sending Duration
 
+        // Quality sampling window. Rolled on a fixed cadence by the timer thread
+        // (not by a reader), so the reported percentages describe the last
+        // completed window and stay identical for every read within it.
+        time_point tsQualityWindow;         // start of the window currently filling
+        int64_t qualBaseSndClean;           // cumulative counters snapshotted at window start
+        int64_t qualBaseSndImpaired;
+        int64_t qualBaseRcvClean;
+        int64_t qualBaseRcvImpaired;
+        double  pctSndQuality;              // last completed window, percent
+        double  pctRcvQuality;
+
     } m_stats;
+
+    /// Roll the quality sampling window if it is due, and recompute the
+    /// percentages from what accumulated inside it. Called from the timer
+    /// thread; takes m_StatsLock.
+    void updateQualityWindow(const time_point& currtime);
 
 public:
     static const int SELF_CLOCK_INTERVAL = 64;  // ACK interval for self-clocking
