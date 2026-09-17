@@ -1,0 +1,31 @@
+name: Create v1.5.7+openirl.3 tag
+
+on:
+  push:
+    paths:
+      - .github/workflows/create-v1.5.7-openirl.3-tag.yml
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Create annotated release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          target="c2405df9fc8f7cf63105a3b67bbafca350547fbc"
+          test "$(git rev-parse origin/main)" = "$target"
+          if git rev-parse 'refs/tags/v1.5.7+openirl.3' >/dev/null 2>&1; then
+            test "$(git rev-list -n 1 'refs/tags/v1.5.7+openirl.3')" = "$target"
+            exit 0
+          fi
+          git tag -a 'v1.5.7+openirl.3' "$target" -m 'Haivision SRT 1.5.7 with full OpenIRL SRTLA patch stack through openirl.3'
+          git push origin 'refs/tags/v1.5.7+openirl.3'
