@@ -10,7 +10,7 @@ permissions:
   contents: write
 
 jobs:
-  merge-probe:
+  port-and-test:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -18,7 +18,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Probe full OpenIRL .3 merge
+      - name: Merge full OpenIRL .3 patch set onto Haivision 1.5.7
         shell: bash
         run: |
           set -euo pipefail
@@ -35,19 +35,141 @@ jobs:
           set -e
 
           if [ "$status" -ne 0 ]; then
-            echo "::group::Conflicted files"
-            git diff --name-only --diff-filter=U
-            echo "::endgroup::"
-            echo "::group::Conflict hunks"
-            git diff --cc || true
-            echo "::endgroup::"
-            git checkout --conflict=diff3 -- . || true
-            git add -A
-            git commit -m "WIP: expose full OpenIRL .3 / Haivision 1.5.7 conflicts" || true
-            git push --force origin HEAD:refs/heads/port/openirl-1.5.7-full-conflicts
-            exit 1
+            conflicts="$(git diff --name-only --diff-filter=U)"
+            expected=$'srtcore/core.cpp\nsrtcore/core.h\nsrtcore/queue.cpp\ntest/test_common.cpp'
+            if [ "$conflicts" != "$expected" ]; then
+              echo "Unexpected merge conflicts:"
+              printf '%s\n' "$conflicts"
+              git diff --cc || true
+              exit 1
+            fi
+
+            git checkout --conflict=diff3 -- srtcore/core.cpp srtcore/core.h srtcore/queue.cpp test/test_common.cpp
+
+            python3 - <<'PY'
+          from pathlib import Path
+
+          def split_conflict(path):
+              p = Path(path)
+              text = p.read_text()
+              if text.count("<<<<<<< ours") != 1 or text.count(">>>>>>> theirs") != 1:
+                  raise SystemExit(f"Unexpected conflict count in {path}")
+              before, rest = text.split("<<<<<<< ours\n", 1)
+              ours, rest = rest.split("||||||| base\n", 1)
+              _base, rest = rest.split("=======\n", 1)
+              theirs, after = rest.split(">>>>>>> theirs\n", 1)
+              return p, before, ours, theirs, after
+
+          # core.cpp: Haivision 1.5.7 rate measurement and OpenIRL .3 SRTLA timing
+          # are independent additions at the same insertion point. Preserve both.
+          p, before, ours, theirs, after = split_conflict("srtcore/core.cpp")
+          p.write_text(before + ours.rstrip() + "\n\n" + theirs.lstrip() + after)
+
+          # core.h: keep the 1.5.7 bool processCtrl signature and add OpenIRL's
+          # confirmed-loss accounting declaration/comments.
+          p, before, ours, theirs, after = split_conflict("srtcore/core.h")
+          replacement = """    /// Record packets that are being requested back for the first time, that is,
+              /// that were still missing once the reorder grace period was over. Feeds
+              /// pctRcvQuality. NAK repeats must not be passed here.
+              /// Takes m_StatsLock, so the caller must not hold it.
+              /// @param pkts  number of sequence numbers confirmed as lost
+              void countConfirmedLoss(int pkts);
+
+              bool processCtrl(const CPacket& ctrlpkt);
+
+          """
+          p.write_text(before + replacement + after)
+
+          # queue.cpp: the conflicting OpenIRL block is the old 1.5.4 mux teardown.
+          # Keep Haivision 1.5.7's removeFromLists/resetAtFork implementation here;
+          # ownership of the SRTLA demux is added to the 1.5.7 destructor in queue.h.
+          p, before, ours, theirs, after = split_conflict("srtcore/queue.cpp")
+          p.write_text(before + ours + after)
+
+          # test_common.cpp: retain both upstream cookie tests and OpenIRL quality tests.
+          p, before, ours, theirs, after = split_conflict("test/test_common.cpp")
+          p.write_text(before + ours.rstrip() + "\n" + theirs.lstrip() + after)
+
+          qh = Path("srtcore/queue.h")
+          text = qh.read_text()
+          old = """        if (m_pSndQueue != NULL)
+                      delete m_pSndQueue;
+                  if (m_pTimer != NULL)
+                      delete m_pTimer;
+          """
+          new = """        if (m_pSndQueue != NULL)
+                      delete m_pSndQueue;
+                  // The SRTLA demux is borrowed by both queues. Destroy it only after
+                  // their workers are gone and before the shared timer/channel teardown.
+                  if (m_pSrtlaRec != NULL)
+                      delete m_pSrtlaRec;
+                  if (m_pTimer != NULL)
+                      delete m_pTimer;
+          """
+          if old not in text:
+              raise SystemExit("CMultiplexer destructor shape changed unexpectedly")
+          qh.write_text(text.replace(old, new, 1))
+
+          for path in [
+              "srtcore/core.cpp", "srtcore/core.h", "srtcore/queue.cpp",
+              "srtcore/queue.h", "test/test_common.cpp"
+          ]:
+              data = Path(path).read_text()
+              if any(marker in data for marker in ("<<<<<<<", "|||||||", "=======", ">>>>>>>")):
+                  raise SystemExit(f"Unresolved conflict marker remains in {path}")
+          PY
+
+            git add srtcore/core.cpp srtcore/core.h srtcore/queue.cpp srtcore/queue.h test/test_common.cpp
           fi
 
           git diff --check
           git commit -m "Merge full OpenIRL SRTLA stack onto Haivision SRT 1.5.7"
+
+      - name: Verify full OpenIRL .3 API/features are present
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q 'SRTO_SRTLA = 120' srtcore/srt.h
+          grep -q 'SRT_SRTLA_STATS' srtcore/srt.h
+          grep -q 'srt_srtla_stats' srtcore/srt.h
+          grep -q 'SRTLA_MIN_RCVLATENCY_MS' srtcore/core.cpp
+          grep -q 'SRTLA_NAK_PERIOD_US' srtcore/core.cpp
+          grep -q 'countConfirmedLoss' srtcore/core.cpp
+          test -f srtcore/srtla_rec.cpp
+          test -f srtcore/srtla_rec.h
+
+      - name: Build patched libsrt
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake g++ make pkg-config tclsh libssl-dev zlib1g-dev libsqlite3-dev
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_SHARED=ON \
+            -DENABLE_UNITTESTS=ON
+          cmake --build build --parallel 2
+          sudo cmake --install build
+          sudo ldconfig
+
+      - name: Run libsrt unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          ctest --test-dir build --output-on-failure
+
+      - name: Build OpenIRL srt-live-server 1.5.2 against patched libsrt
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch 1.5.2 https://github.com/OpenIRL/srt-live-server.git /tmp/srt-live-server
+          make -C /tmp/srt-live-server -j2
+
+      - name: Publish tested branch and compatibility tag
+        shell: bash
+        run: |
+          set -euo pipefail
           git push --force origin HEAD:refs/heads/port/openirl-1.5.7-full
+          git tag -f -a v1.5.7+openirl.3 -m "Full OpenIRL SRTLA stack on Haivision SRT 1.5.7"
+          git push --force origin refs/tags/v1.5.7+openirl.3
